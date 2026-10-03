@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { resolvePiLaunchToolPlan } from "../../src/runs/shared/child-tool-plan.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
-import { MCP_RUNTIME_SNAPSHOT_EVENT, MCP_RUNTIME_SNAPSHOT_VERSION, type McpRuntimeSnapshotHost } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
+import { MCP_RUNTIME_SNAPSHOT_EVENT, MCP_RUNTIME_SNAPSHOT_VERSION, type McpHostToolInfo, type McpRuntimeSnapshotHost } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 
 /** A parent whose pi-mcp-adapter answers snapshot requests for one runtime-only server. */
 function runtimeSnapshotHost(serverName: string): McpRuntimeSnapshotHost {
@@ -18,6 +18,86 @@ function runtimeSnapshotHost(serverName: string): McpRuntimeSnapshotHost {
 		},
 	};
 }
+
+/** A parent whose /mcp is owned by `mcpOwner` and whose tool registry holds `tools`. */
+function mcpHost(mcpOwner: string, tools: McpHostToolInfo[]): McpRuntimeSnapshotHost {
+	return {
+		events: { emit() {} },
+		getCommands: () => [{ name: "mcp", sourceInfo: { path: mcpOwner } }],
+		getAllTools: () => tools,
+	};
+}
+
+const BUILTIN_MCP_TOOLS: McpHostToolInfo[] = [
+	{ name: "mcp__docs__search_pages", exposure: "codemode", namespace: { name: "mcp__docs" } },
+	{ name: "mcp__docs__fetch", exposure: "direct", namespace: { name: "mcp__docs" } },
+	{ name: "mcp__docs__admin", exposure: "hidden", namespace: { name: "mcp__docs" } },
+	{ name: "mcp__other__fetch", exposure: "codemode", namespace: { name: "mcp__other" } },
+];
+
+describe("child tool plan with Pi built-in MCP", () => {
+	const host = mcpHost("builtin:mcp", BUILTIN_MCP_TOOLS);
+
+	it("grants every non-hidden tool of a selected server as a required child tool", () => {
+		const plan = resolvePiLaunchToolPlan({ tools: ["read"], mcpDirectTools: ["docs"], runtimeSnapshotHost: host });
+		const granted = ["mcp__docs__search_pages", "mcp__docs__fetch"];
+		assert.deepEqual(plan.builtinMcpTools, granted.map((name) => ({ name, selector: "docs" })));
+		assert.deepEqual(plan.effectiveToolAllowlist, ["read", ...granted]);
+		assert.deepEqual(plan.requiredChildTools, ["read", ...granted]);
+	});
+
+	it("grants one tool for a tool selector and applies exclusions", () => {
+		const plan = resolvePiLaunchToolPlan({ mcpDirectTools: ["docs/search.pages", "docs/fetch"], excludeTools: ["mcp__docs__fetch"], runtimeSnapshotHost: host });
+		assert.deepEqual(plan.builtinMcpTools, [{ name: "mcp__docs__search_pages", selector: "docs/search.pages" }]);
+	});
+
+	it("grants the hash-suffixed name Pi gives a tool whose sanitized name another tool took", () => {
+		const plan = resolvePiLaunchToolPlan({ mcpDirectTools: ["srv/a.b"], runtimeSnapshotHost: mcpHost("builtin:mcp", [
+			{ name: "mcp__srv__a_b", exposure: "codemode", namespace: { name: "mcp__srv" } },
+			{ name: "mcp__srv__a_b_df0974cd", exposure: "codemode", namespace: { name: "mcp__srv" } },
+		]) });
+		assert.deepEqual(plan.effectiveMcpTools, ["mcp__srv__a_b_df0974cd"]);
+	});
+
+	it("resolves a raw hyphenated selector to the name and namespace Pi gives the tool", () => {
+		const plan = resolvePiLaunchToolPlan({
+			mcpDirectTools: ["my-docs/get-item"],
+			capabilityCeiling: { version: 1, allowedTools: ["mcp__my_docs__get_item"], sources: ["test"] },
+			runtimeSnapshotHost: mcpHost("builtin:mcp", [{ name: "mcp__my_docs__get_item", exposure: "codemode", namespace: { name: "mcp__my_docs" } }]),
+		});
+		assert.deepEqual(plan.builtinMcpTools, [{ name: "mcp__my_docs__get_item", selector: "my-docs/get-item" }]);
+	});
+
+	it("fails a launch whose selector matches no offered tool", () => {
+		assert.throws(
+			() => resolvePiLaunchToolPlan({ mcpDirectTools: ["docs/admin", "gone"], agentName: "browser", runtimeSnapshotHost: host }),
+			/Agent 'browser' selects MCP tools that Pi's built-in MCP does not offer: mcp:docs\/admin, mcp:gone\. The server may be missing, disconnected, still connecting, or its tools hidden; check \/mcp\./,
+		);
+	});
+
+	for (const [description, adapterHost] of [
+		["when the adapter owns /mcp", mcpHost("/ext/pi-mcp-adapter/index.ts", BUILTIN_MCP_TOOLS)],
+		["when adapter 3.x loads next to Pi's built-in /mcp", {
+			...mcpHost("builtin:mcp", BUILTIN_MCP_TOOLS),
+			getCommands: () => [
+				{ name: "mcp", sourceInfo: { path: "builtin:mcp" } },
+				{ name: "mcp-adapter", sourceInfo: { path: "/ext/pi-mcp-adapter/index.ts" } },
+			],
+		}],
+	] satisfies Array<[string, McpRuntimeSnapshotHost]>) {
+		it(`keeps the pi-mcp-adapter path ${description}`, () => {
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-adapter-mcp-"));
+			try {
+				assert.throws(
+					() => resolvePiLaunchToolPlan({ mcpDirectTools: ["docs"], cwd, runtimeSnapshotHost: adapterHost }),
+					/Unresolved MCP direct-tool selectors: docs\. Direct MCP tools require a matching configured server/,
+				);
+			} finally {
+				fs.rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+	}
+});
 
 describe("child tool plan", () => {
 	it("does not grant watchdog_diff unless an agent explicitly requests it", () => {
@@ -49,6 +129,21 @@ describe("child tool plan declared tools", () => {
 		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "grep", "find", "ls", "bash"]);
 		assert.deepEqual(plan.requiredChildTools, ["read", "grep", "find", "ls", "bash"]);
 		assert.deepEqual(plan.warnings, []);
+	});
+
+	it("grants command observation only when explicitly declared", () => {
+		const automatic = resolvePiLaunchToolPlan({ tools: ["bash"] });
+		assert.deepEqual(automatic.effectiveToolAllowlist, ["bash"]);
+		assert.deepEqual(automatic.requiredChildTools, ["bash"]);
+		const explicit = resolvePiLaunchToolPlan({ tools: ["bash", "subagent_command"] });
+		assert.deepEqual(explicit.requiredChildTools, ["bash", "subagent_command"]);
+	});
+
+	it("does not enable command controls through a ceiling alone and honors explicit exclusions", () => {
+		const ceiling = { version: 1 as const, allowedTools: ["bash", "subagent_command"], denyExtensions: false, sources: ["test"] };
+		assert.deepEqual(resolvePiLaunchToolPlan({ capabilityCeiling: ceiling }).effectiveToolAllowlist, ["bash"]);
+		assert.deepEqual(resolvePiLaunchToolPlan({ tools: ["bash", "subagent_command"], excludeTools: ["subagent_command"] }).effectiveToolAllowlist, ["bash"]);
+		assert.deepEqual(resolvePiLaunchToolPlan({ tools: ["bash", "subagent_command"], capabilityCeiling: { ...ceiling, allowedTools: ["bash"] } }).effectiveToolAllowlist, ["bash"]);
 	});
 
 	it("adds read for lazy skill loading without an explicit declaration", () => {

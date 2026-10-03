@@ -8,7 +8,8 @@ import { deliverStopRequest, stopInboxClosedPath } from "../background/control-c
 import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
-import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
+import { readStatus } from "../../shared/utils.ts";
+import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
 
 function getAsyncStopTarget(
 	state: SubagentState,
@@ -108,6 +109,18 @@ export function stopAsyncRun(
 	childId?: string,
 ): AgentToolResult<Details> | null {
 	const target = getAsyncStopTarget(state, runId, location);
+	// An async workflow runs in this process: it has no runner to read a stop request, so stop it through its controller.
+	const workflowRunId = target?.asyncId ?? runId;
+	const workflowController = childId === undefined && workflowRunId ? state.workflowControllers?.get(workflowRunId) : undefined;
+	const workflowAsyncDir = workflowController && workflowRunId ? target?.asyncDir ?? state.asyncJobs.get(workflowRunId)?.asyncDir : undefined;
+	const workflowStatus = workflowAsyncDir ? readStatus(workflowAsyncDir) : undefined;
+	// Controllers outlive a session switch; a workflow owned by another session falls through to the ownership check below.
+	const foreignWorkflow = Boolean(state.currentSessionId && workflowStatus && workflowStatus.sessionId !== state.currentSessionId);
+	if (workflowController && workflowRunId && !foreignWorkflow) {
+		if (workflowStatus) stopStoppableAsyncStatusChildren(workflowStatus, state.workflowChildStops?.get(workflowRunId), "Workflow stopped.");
+		workflowController.abort(new Error("Workflow stopped."));
+		return { content: [{ type: "text", text: `Stop requested for async workflow ${workflowRunId}.` }], details: { mode: "management", results: [] } };
+	}
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
 	if (state.currentSessionId && status?.sessionId !== state.currentSessionId) {

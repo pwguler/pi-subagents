@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Text } from "@earendil-works/pi-tui";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
-import { captureWatchdogDiffBaseline, type WatchdogDiffBaseline } from "./diff-tool.ts";
+import { startWatchdogDiffBaselineCapture, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { formatWatchdogRecommendation, recommendWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
 import { renderWatchdogWarning } from "./render.ts";
 import { createMainWatchdogReview } from "./review.ts";
@@ -372,7 +372,7 @@ async function handleWatchdogCommand(
 
 export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatchdogOptions = {}): MainWatchdogRuntime {
 	let currentContext: ExtensionContext | undefined;
-	let diffBaseline: WatchdogDiffBaseline | undefined;
+	let diffBaseline: Promise<WatchdogDiffBaseline | undefined> | undefined;
 	const rememberContext = (ctx: ExtensionContext) => {
 		currentContext = ctx;
 	};
@@ -412,7 +412,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 
 	pi.on("session_start", (_event, ctx) => {
 		rememberContext(ctx);
-		diffBaseline = captureWatchdogDiffBaseline(ctx.cwd);
+		diffBaseline = startWatchdogDiffBaselineCapture(ctx.cwd);
 		runtime.bindSession(ctx);
 	});
 	pi.on("before_agent_start", (event, ctx) => {
@@ -423,7 +423,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		rememberContext(ctx);
 		runtime.handleTurnEnd(event, ctx);
 	});
-	pi.on("input", (event) => { if (event.source !== "extension") runtime.handleUserInput(); });
+	pi.on("input", (event) => runtime.handleUserInput(event));
 	pi.on("model_select", () => runtime.handleModelChange());
 	pi.on("tool_result", (_event, ctx) => {
 		rememberContext(ctx);

@@ -11,7 +11,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { CHILD_COMMAND_TOOL, createChildCommandRuntime } from "./child-commands.ts";
+import { supervisorChannelDir } from "./child-tool-plan.ts";
 import { pinChildCacheRetention } from "../../shared/child-cache-retention.ts";
 import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../shared/utils.ts";
 import { resolvePackageSubpath } from "../background/runner-aliases.ts";
@@ -55,6 +57,8 @@ export interface ChildSessionLaunch {
 	cwd: string;
 	/** Resolved pane-native placement. Local launches omit this field. */
 	machine?: HerdrMachineReference;
+	/** The launching session's project trust; undefined keeps Pi's default for hosts without trust. */
+	projectTrusted?: boolean;
 	/** Process-local provider source owned by the invoking foreground parent. */
 	parentProviderRegistry?: ParentProviderRegistry;
 	/** Logical names resolved only by the remote ambient package. */
@@ -64,6 +68,8 @@ export interface ChildSessionLaunch {
 	model?: string;
 	/** Explicit tool allowlist; undefined keeps pi's defaults. */
 	tools?: string[];
+	/** Tools of Pi's built-in MCP extension the child must declare to its model directly, with the `mcp:` selector that granted each; `tools` names them too. */
+	builtinMcpTools?: Array<{ name: string; selector: string }>;
 	excludeTools?: string[];
 	/** Extension files loaded for this child in addition to the inline hooks. */
 	extensionPaths: string[];
@@ -100,12 +106,16 @@ export interface ChildSession {
 	abort(): Promise<void>;
 	/** Emits `session_shutdown` to the child's extensions and disposes the session; resolves once that shutdown work is done. */
 	dispose(): Promise<void>;
+	/** Final settlement check for commands owned by this child; unfinished commands are cancelled and reject completion. */
+	finishCommands?(): Promise<void>;
 	/** True while Pi still has steering or follow-up input that has not started a turn. */
 	hasQueuedMessages?(): boolean;
 	readonly messages: readonly AgentMessage[];
 	readonly sessionFile: string | undefined;
 	readonly sessionId: string;
 	readonly modelId: string | undefined;
+	/** Live provider/id of the selected model when Pi marks it virtual (`api === "pi-virtual"`); assistant messages then name the dispatched physical model. */
+	readonly virtualModelId?: string;
 	readonly contextWindow?: number;
 	readonly machineEvidence?: { machineId: string; initial?: HerdrRemoteGitStatus; final?: HerdrRemoteGitStatus };
 	/** Event-updated pane-native status; reading it performs no network work. */
@@ -141,6 +151,8 @@ export interface DefaultChildSessionFactoryOptions {
 	loadPiCodingAgent?: () => Promise<PiCodingAgentModule>;
 	/** Upper bound on a disposed child's `session_shutdown` handlers before the session is dropped anyway. */
 	shutdownTimeoutMs?: number;
+	/** Upper bound on the wait for selected built-in MCP tools to register after the session starts. */
+	builtinMcpToolWaitMs?: number;
 }
 
 type ModelRuntimeInstance = Awaited<ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]>>;
@@ -188,6 +200,30 @@ function prioritizeChildPromptRuntime<T extends { extensions: Array<{ path: stri
 	return { ...result, extensions };
 }
 
+/** Ambient bash overrides keep their original backend and priority. */
+function prioritizeChildCommandRuntime<T extends { extensions: Array<{ path: string; tools?: Map<string, unknown> }> }>(result: T): T {
+	const index = result.extensions.findIndex(({ path }) => path === "<inline:pi-subagents:commands>");
+	if (index < 0) return result;
+	if (result.extensions.some((extension, otherIndex) => otherIndex !== index && extension.tools?.has("bash"))) {
+		const extensions = result.extensions.filter((_, otherIndex) => otherIndex !== index);
+		if (!extensions.some((extension) => extension.tools?.has(CHILD_COMMAND_TOOL))) {
+			const commands = result.extensions[index]!;
+			const registered = commands.tools!.get(CHILD_COMMAND_TOOL) as { definition: ToolDefinition };
+			const reason = "Native command controls are unavailable with the active custom bash backend. Use that backend's own command controls.";
+			extensions.push({ ...commands, tools: new Map([[CHILD_COMMAND_TOOL, { ...registered, definition: {
+				...registered.definition, description: reason,
+				execute: async () => { throw new Error(reason); },
+			} }]]) });
+		}
+		return { ...result, extensions };
+	}
+	if (index === 0) return result;
+	const extensions = [...result.extensions];
+	const [commands] = extensions.splice(index, 1);
+	extensions.unshift(commands!);
+	return { ...result, extensions };
+}
+
 /** One launch at a time from env application through `session_start`, so parallel launches never observe each other's `processEnv` while their extensions load and start. */
 let loading: Promise<unknown> = Promise.resolve();
 
@@ -209,6 +245,53 @@ function applyProcessEnv(values: Record<string, string | undefined> | undefined)
 	for (const [name, value] of Object.entries(values)) {
 		if (value === undefined) delete process.env[name];
 		else process.env[name] = value;
+	}
+}
+
+/**
+ * Pi's built-in MCP extension registers server tools with the configured exposure, `codemode` by
+ * default, which the child's `tools` allowlist cannot declare. Registering the selected names as
+ * `direct` makes them model-declared and callable; `hidden` stays hidden. A name counts only when
+ * the tool's raw identity, its `<server>/<tool>` label, matches the granting selector: Pi can give
+ * the sanitized name of `srv/a.b` to `srv/a_b`. Every other tool the extension registers becomes
+ * `hidden`, so neither codemode nor `ctx.executeTool()` can call it, independent of the `tools`
+ * allowlist. The `builtin` entry loads
+ * through the explicit `builtin:mcp` path even with `noExtensions`, and `replaceable` lets an
+ * ambient MCP extension that registers `/mcp` replace it, as in the parent.
+ */
+function selectedBuiltinMcpExtension(pi: PiCodingAgentModule, selections: ReadonlyArray<{ name: string; selector: string }>): ChildHookExtension & { builtin: true; replaceable: true } {
+	// Pi 0.99 export; the pinned SDK types predate it.
+	const createMcpExtension = (pi as { createMcpExtension?: () => (api: ExtensionAPI) => void | Promise<void> }).createMcpExtension;
+	if (typeof createMcpExtension !== "function") throw new Error(`Selected built-in MCP tools (${selections.map(({ name }) => name).join(", ")}) need a Pi version with built-in MCP.`);
+	const selectors = new Map(selections.map(({ name, selector }) => [name, selector]));
+	const granted = (tool: { name: string; label?: string; exposure?: string }) => {
+		const selector = selectors.get(tool.name);
+		if (selector === undefined || tool.exposure === "hidden" || tool.label === undefined) return false;
+		return selector.includes("/") ? tool.label === selector : tool.label.startsWith(`${selector}/`);
+	};
+	const mcp = createMcpExtension();
+	const factory = (api: ExtensionAPI) => mcp(new Proxy(api, {
+		get(target, prop) {
+			if (prop === "registerTool") {
+				return (tool: Parameters<ExtensionAPI["registerTool"]>[0] & { exposure?: string }) =>
+					target.registerTool({ ...tool, exposure: granted(tool) ? "direct" : "hidden" } as typeof tool);
+			}
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}));
+	return { name: "mcp", factory, builtin: true, replaceable: true };
+}
+
+/** MCP connects after `session_start`, so the selected tools register some time after the session binds. */
+async function missingBuiltinMcpTools(session: { getAllTools(): Array<{ name: string }>; getActiveToolNames(): string[] }, names: readonly string[], timeoutMs: number, stopped: () => boolean): Promise<string[]> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const active = new Set(session.getActiveToolNames());
+		const direct = new Set(session.getAllTools().filter((tool) => (tool as { exposure?: string }).exposure === "direct").map(({ name }) => name));
+		const missing = names.filter((name) => !active.has(name) || !direct.has(name));
+		if (missing.length === 0 || stopped() || Date.now() >= deadline) return missing;
+		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
 }
 
@@ -239,6 +322,25 @@ function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModu
 		}
 	}
 	if (Array.isArray(runtime.pendingNativeProviderRegistrations)) runtime.pendingNativeProviderRegistrations = [];
+	// Pi core flushes pendingVirtualModelRegistrations when a session binds extensions
+	// (agent-session-services), but this factory resolves the requested model before that
+	// binding, so an extension-registered virtual model never resolves for the child. The
+	// structural cast keeps compiling against SDK versions that predate virtual models;
+	// there the queue is absent and the loop is a no-op.
+	const virtualModelRuntime = modelRuntime as ModelRuntimeInstance & { registerVirtualModel?: (definition: unknown) => void };
+	const virtualModelQueue = runtime as { pendingVirtualModelRegistrations?: Array<{ definition: unknown; extensionPath: string }> };
+	const pendingVirtualModelRegistrations = virtualModelQueue.pendingVirtualModelRegistrations ?? [];
+	for (const { definition, extensionPath } of pendingVirtualModelRegistrations) {
+		if (typeof virtualModelRuntime.registerVirtualModel !== "function") break;
+		try {
+			virtualModelRuntime.registerVirtualModel(definition);
+			registered = true;
+		} catch (error) {
+			onError?.({ extensionPath, event: "register_virtual_model", error });
+			if (requiredPaths.has(extensionPath)) throw new Error(`Required child extension virtual model registration failed for '${extensionPath}': ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	if (Array.isArray(virtualModelQueue.pendingVirtualModelRegistrations)) virtualModelQueue.pendingVirtualModelRegistrations = [];
 	return { claimedProviderIds, registered };
 }
 
@@ -292,10 +394,14 @@ function isUnknownRecord(value: unknown): value is Record<string, unknown> {
 export function createDefaultChildSessionFactory(options: DefaultChildSessionFactoryOptions = {}): ChildSessionFactory {
 	const loadPiCodingAgent = options.loadPiCodingAgent ?? loadHostPiCodingAgent;
 	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
+	const builtinMcpToolWaitMs = options.builtinMcpToolWaitMs ?? 10_000;
 	let runtime: ReturnType<PiCodingAgentModule["ModelRuntime"]["create"]> | undefined;
 	const live = new Set<ChildSession>();
 	/** Extension shutdowns still running for disposed children; `dispose()` waits for them. */
 	const shutdowns = new Set<Promise<void>>();
+	/** Launches still waiting for their MCP tools; `dispose()` ends the wait and waits for their shutdown. */
+	const mcpWaits = new Set<Promise<void>>();
+	let disposals = 0;
 	const sharedRuntime = async (pi: PiCodingAgentModule) => {
 		runtime ??= pi.ModelRuntime.create().catch((error: unknown) => {
 			runtime = undefined;
@@ -305,33 +411,72 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 	};
 	return {
 		async create(launch) {
+			const disposalsAtStart = disposals;
 			const pi = await loadPiCodingAgent();
+			const builtinMcpTools = launch.builtinMcpTools ?? [];
+			const builtinMcp = builtinMcpTools.length ? selectedBuiltinMcpExtension(pi, builtinMcpTools) : undefined;
 			const modelRuntime = launch.parentProviderRegistry
 				? await pi.ModelRuntime.create()
 				: await sharedRuntime(pi);
 			const agentDir = getAgentDir();
-			const settingsManager = pi.SettingsManager.create(launch.cwd, agentDir);
+			const commands = launch.runtime.runId && launch.runtime.agent && launch.runtime.childIndex !== undefined
+				&& launch.tools?.includes("bash") && launch.tools.includes(CHILD_COMMAND_TOOL)
+				&& !launch.excludeTools?.includes("bash") && !launch.excludeTools?.includes(CHILD_COMMAND_TOOL)
+				&& typeof pi.createBashTool === "function"
+				? createChildCommandRuntime(supervisorChannelDir(launch.runtime.runId, launch.runtime.agent, launch.runtime.childIndex)) : undefined;
+			const settingsManager = pi.SettingsManager.create(launch.cwd, agentDir, { projectTrusted: launch.projectTrusted });
 			// Foreground children share Pi's global theme with the parent, so reinitializing it
 			// would overwrite the parent's active light/dark appearance. Detached runners have
 			// no initialized theme and must initialize one for headless extension renderers.
 			const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
 			const themeInitialized = Boolean((globalThis as Record<symbol, unknown>)[themeKey]);
 			if (!themeInitialized && typeof pi.initTheme === "function") pi.initTheme(settingsManager.getTheme());
+			// SDK sessions do not install Pi's CLI built-ins. Use the host's own
+			// codemode factory only when this child can select it; older Pi hosts
+			// without that factory retain the strict missing-tool diagnostic.
+			const createCodemodeExtension = (pi as PiCodingAgentModule & { createCodemodeExtension?: () => ChildHookExtension["factory"] }).createCodemodeExtension;
+			const codemode = typeof createCodemodeExtension === "function" &&
+				!launch.runtime.capabilityCeiling?.denyExtensions &&
+				(launch.tools === undefined || launch.tools.includes("codemode")) &&
+				!launch.excludeTools?.includes("codemode")
+				? [{ name: "codemode", factory: createCodemodeExtension(), replaceable: true }]
+				: [];
 			const loader = new pi.DefaultResourceLoader({
 				cwd: launch.cwd,
 				agentDir,
 				settingsManager,
 				noExtensions: !launch.ambientExtensions,
 				noSkills: launch.noSkills,
+				// Pi merges skills from extensions' resources_discover without checking noSkills.
+				skillsOverride: launch.noSkills ? (base) => ({ ...base, skills: [] }) : undefined,
 				noPromptTemplates: true,
 				noThemes: true,
 				noContextFiles: launch.noContextFiles,
-				additionalExtensionPaths: launch.extensionPaths,
-				extensionFactories: launch.hooks,
-				extensionsOverride: prioritizeChildPromptRuntime,
+				additionalExtensionPaths: builtinMcp ? [...launch.extensionPaths, "builtin:mcp"] : launch.extensionPaths,
+				extensionFactories: [...launch.hooks, ...(commands ? [{ name: "pi-subagents:commands", factory: (api: ExtensionAPI) => {
+					api.registerTool(commands.wrap(pi.createBashTool(launch.cwd, { commandPrefix: settingsManager.getShellCommandPrefix(), shellPath: settingsManager.getShellPath() }) as unknown as ToolDefinition));
+					api.registerTool(commands.tool());
+				} }] : []), ...codemode, ...(builtinMcp ? [builtinMcp] : [])],
+				extensionsOverride: (result) => prioritizeChildPromptRuntime(prioritizeChildCommandRuntime(result)),
 				...(launch.systemPrompt !== undefined ? { systemPrompt: launch.systemPrompt } : {}),
 				...(launch.appendSystemPrompt !== undefined ? { appendSystemPrompt: [launch.appendSystemPrompt] } : {}),
 			});
+			// pi's own hosts emit `session_shutdown` before disposing a session so the
+			// extensions loaded into it (ambient extensions included) release their
+			// watchers, servers, and timers. Do the same, then dispose.
+			const shutdownSession = async (session: Awaited<ReturnType<PiCodingAgentModule["createAgentSession"]>>["session"]): Promise<void> => {
+				try {
+					await commands?.shutdown();
+					const runner = session.extensionRunner;
+					if (runner.hasHandlers("session_shutdown")) {
+						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
+					}
+				} catch (error) {
+					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
+				} finally {
+					session.dispose();
+				}
+			};
 			const open = async () => {
 				const requiredPaths = new Set((launch.requiredExtensions ?? []).map(({ path }) => path));
 				applyProcessEnv(launch.processEnv);
@@ -377,14 +522,27 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 					sessionStartEvent: { type: "session_start", reason: "startup" },
 				});
 				pinChildCacheRetention(session.agent);
+				// Pi reports handler failures through onError instead of throwing, so required startup failures must be collected here.
+				const requiredStartupErrors: string[] = [];
+				let binding = true;
 				try {
 					await session.bindExtensions({
 						mode: "print",
-						onError: (error) => launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error }),
+						onError: (error) => {
+							if (binding && requiredPaths.has(error.extensionPath)) requiredStartupErrors.push(`${error.extensionPath} (${error.event}): ${error.error}`);
+							launch.onExtensionError?.({ extensionPath: error.extensionPath, event: error.event, error: error.error });
+						},
 					});
 				} catch (error) {
 					session.dispose();
 					throw error;
+				} finally {
+					binding = false;
+				}
+				if (requiredStartupErrors.length > 0) {
+					// Binding finished, so the other extensions' session_start handlers ran and may hold resources.
+					await shutdownSession(session);
+					throw new Error(`Required child extension failed during startup: ${requiredStartupErrors.join("; ")}`);
 				}
 				return session;
 			};
@@ -392,24 +550,24 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 			loading = opened;
 			const session = await opened;
 			let pending: Promise<void> | undefined;
-			// pi's own hosts emit `session_shutdown` before disposing a session so the
-			// extensions loaded into it (ambient extensions included) release their
-			// watchers, servers, and timers. Do the same, then dispose.
-			const shutdown = async (): Promise<void> => {
-				try {
-					const runner = session.extensionRunner;
-					if (runner.hasHandlers("session_shutdown")) {
-						await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), new Promise<void>((resolve) => setTimeout(resolve, shutdownTimeoutMs).unref?.())]);
-					}
-				} catch (error) {
-					launch.onExtensionError?.({ extensionPath: "<session>", event: "session_shutdown", error });
-				} finally {
-					session.dispose();
-				}
-			};
+			const shutdown = () => shutdownSession(session);
+			// Outside the launch lock: MCP servers connect after `session_start` without reading the per-launch env.
+			if (builtinMcpTools.length) {
+				const disposed = () => disposals !== disposalsAtStart;
+				const ready = missingBuiltinMcpTools(session, builtinMcpTools.map(({ name }) => name), builtinMcpToolWaitMs, disposed).then(async (missing) => {
+					if (!missing.length && !disposed()) return;
+					await shutdown();
+					throw new Error(disposed()
+						? "The child session factory was disposed while the child waited for its MCP tools."
+						: `Selected built-in MCP tools did not register in the child session: ${missing.join(", ")}. The MCP server may have failed to connect, or the name belongs to a different tool than the selector names; check it with /mcp.`);
+				});
+				mcpWaits.add(ready);
+				try { await ready; } finally { mcpWaits.delete(ready); }
+			}
 			const child: ChildSession = {
 				subscribe: (listener) => session.subscribe((event) => listener(event as unknown as ChildSessionEvent)),
 				prompt: (text) => session.prompt(text),
+				...(commands ? { finishCommands: () => commands.finish() } : {}),
 				steer: (text) => session.steer(text),
 				followUp: (text) => session.followUp(text),
 				abort: () => session.abort(),
@@ -428,19 +586,21 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 				get sessionFile() { return session.sessionFile; },
 				get sessionId() { return session.sessionId; },
 				get modelId() { return session.model ? `${session.model.provider}/${session.model.id}` : undefined; },
+				get virtualModelId() { return session.model?.api === "pi-virtual" ? `${session.model.provider}/${session.model.id}` : undefined; },
 				get contextWindow() { return session.model?.contextWindow; },
 			};
 			live.add(child);
 			return child;
 		},
 		async dispose() {
+			disposals += 1;
 			const children = [...live].filter((child) => !child.detached);
 			for (const child of children) child.shutDown = true;
 			await Promise.allSettled(children.map((child) => child.abort()));
 			for (const child of children) {
 				try { void child.dispose(); } catch { /* best effort */ }
 			}
-			await Promise.allSettled([...shutdowns]);
+			await Promise.allSettled([...shutdowns, ...mcpWaits]);
 			if (live.size === 0) runtime = undefined;
 		},
 	};

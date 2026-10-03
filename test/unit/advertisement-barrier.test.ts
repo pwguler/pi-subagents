@@ -5,9 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { it } from "node:test";
 import { fileURLToPath } from "node:url";
-import { resolveInstalledPiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
-import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -46,8 +44,6 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 		const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, HOME: path.join(temp, "home"), USERPROFILE: path.join(temp, "home"), PI_CODING_AGENT_DIR: path.join(temp, "home"), TEST_PROJECT: path.join(fixtureRoot, "project"), TEST_OLD_DONE: oldDone, TEST_NPM_PHASE: "initial", APPDATA: path.join(temp, "missing-appdata") };
 		delete env.PI_OFFLINE;
 		delete env[SUBAGENT_CHILD_ENV];
-		const hostRoot = resolveInstalledPiPackageRoot();
-		if (hostRoot) env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = hostRoot;
 		const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", String.raw`
 			import assert from "node:assert/strict";
 			import fs from "node:fs";
@@ -100,10 +96,9 @@ setTimeout(() => { if (phase === "old") fs.writeFileSync(${JSON.stringify(oldDon
 				assert.match(text, /<name>global-specialist<\/name>/);
 				assert.match(text, /<name>local-specialist<\/name>/);
 			}
-			assert.match(loader.content[0].text, /If it has a subagent tool now \(the name may carry a prefix\), call it, starting with subagent\(\{action:"list",capabilities:true\}\)/);
-			assert.match(loader.content[0].text, /If it does not, your provider fixes the tool list for the whole prompt: subagent will appear after the next user prompt, so do not retry it in this one\./);
-			assert.match(loader.content[0].text, /The operator can start Pi with --exclude-tools subagents_enable to keep subagent always available\./);
-			assert.doesNotMatch(loader.content[0].text, /Some providers|bridges to another agent SDK/);
+			assert.match(loader.content[0].text, /If your tool list includes subagent \(possibly prefixed\), call subagent\(\{action:"list",capabilities:true\}\)\./);
+			assert.match(loader.content[0].text, /Otherwise, wait for the next user prompt; do not retry now\./);
+			assert.match(loader.content[0].text, /Start Pi with --exclude-tools subagents_enable to keep subagent always available\./);
 			process.env.TEST_NPM_PHASE = "seed";
 			assert.ok(discoverAgents(ctx.cwd, "both").agents.some((agent) => agent.name === "global-specialist"));
 			process.env.TEST_NPM_PHASE = "old";

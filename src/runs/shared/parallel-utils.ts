@@ -40,6 +40,8 @@ export interface RunnerSubagentStep {
 	contextLimit?: number;
 	fast?: boolean;
 	thinking?: string;
+	/** Trailing Claude Code argv for an explicit model/thinking request. */
+	claudeCodeOverrideArgs?: string[];
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 	requestedModel?: string;
 	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
@@ -56,6 +58,8 @@ export interface RunnerSubagentStep {
 	/** Private immutable host policy snapshot serialized to the native runner. */
 	requiredExtensions?: import("../../shared/required-child-extensions.ts").RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];
+	/** The parent's resolution of `mcpDirectTools` against Pi's built-in MCP; the runner has no host to repeat it. */
+	builtinMcpTools?: import("./mcp-direct-tool-grant.ts").ResolvedMcpDirectToolSelection[];
 	mutationTools?: string[];
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";

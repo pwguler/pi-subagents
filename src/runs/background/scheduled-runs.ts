@@ -16,6 +16,9 @@ import { resolveGitRepositoryIdentity } from "../../workflows/chat-progress.ts";
 import { getConfigDirName } from "../../shared/utils.ts";
 import { normalizeWorktreeBaseRef } from "../shared/worktree.ts";
 import { deepFreezeWorkflowArgs, normalizeWorkflowArgs } from "../../workflows/workflow-resources.ts";
+import { readMission, resolveMissionStoreLocation, validateMissionId } from "../../missions/store.ts";
+
+import { calendarDateAfter, latestCalendarOccurrence, nextCalendarOccurrence, normalizeCalendarRule, restoreCalendarTrigger, type CalendarTrigger } from "./calendar-schedule.ts";
 
 export const SCHEDULED_RUN_ACTIONS = [
 	"schedule.create",
@@ -40,11 +43,12 @@ export type ScheduledRunAction = typeof SCHEDULED_RUN_ACTIONS[number];
 export type ScheduleRunState = "running" | "skipped" | "missed" | "completed" | "failed_launch" | "failed_run";
 export type ScheduleTrigger =
 	| { kind: "once"; at: string; nextRunAt?: string }
-	| { kind: "interval"; every: string; everyMs: number; anchorAt: string; nextRunAt: string };
-export type ScheduleTarget = { workflowScript: string; args: Record<string, unknown>; baseRef?: string };
+	| { kind: "interval"; every: string; everyMs: number; anchorAt: string; nextRunAt: string }
+	| CalendarTrigger;
+export type ScheduleTarget = { workflowScript: string; args: Record<string, unknown>; baseRef?: string; missionId?: string };
 
 export interface ScheduleRecord {
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	id: string;
 	name: string;
 	cwd: string;
@@ -284,26 +288,32 @@ function readJson(file: string, label: string): unknown {
 
 function parseScheduleTarget(value: unknown, file: string): ScheduleTarget {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Schedule record '${file}' has invalid trigger or target.`);
-	const target = value as { workflowScript?: unknown; args?: unknown; baseRef?: unknown; agent?: unknown; task?: unknown };
+	const target = value as { workflowScript?: unknown; args?: unknown; baseRef?: unknown; missionId?: unknown; agent?: unknown; task?: unknown };
 	if (typeof target.workflowScript === "string" && target.workflowScript.trim()) {
 		let baseRef: string | undefined;
+		let missionId: string | undefined;
 		try {
 			baseRef = normalizeWorktreeBaseRef(target.baseRef);
 		} catch (error) {
 			throw new Error(`Schedule record '${file}' has an invalid baseRef: ${error instanceof Error ? error.message : String(error)}`);
 		}
+		try {
+			missionId = target.missionId === undefined ? undefined : validateMissionId(target.missionId);
+		} catch (error) {
+			throw new Error(`Schedule record '${file}' has an invalid missionId: ${error instanceof Error ? error.message : String(error)}`);
+		}
 		const normalizedArgs = normalizeWorkflowArgs(target.args);
 		if ("error" in normalizedArgs) throw new Error(`Schedule record '${file}' has invalid args: ${normalizedArgs.error}`);
-		return { workflowScript: target.workflowScript.trim(), args: deepFreezeWorkflowArgs(normalizedArgs.args), ...(baseRef === undefined ? {} : { baseRef }) };
+		return { workflowScript: target.workflowScript.trim(), args: deepFreezeWorkflowArgs(normalizedArgs.args), ...(baseRef === undefined ? {} : { baseRef }), ...(missionId === undefined ? {} : { missionId }) };
 	}
-	if (target.agent !== undefined || target.task !== undefined) throw new Error(`Schedule record '${file}' uses a removed legacy agent target; recreate it with target.workflowScript.`);
+	if (target.agent !== undefined || target.task !== undefined) throw new Error(`Schedule record '${file}' uses a removed legacy agent target; recreate it with schedule.create and workflow: true or a workflow script path.`);
 	throw new Error(`Schedule record '${file}' requires a workflowScript target.`);
 }
 
 function parseSchedule(value: unknown, file: string): ScheduleRecord {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Schedule record '${file}' must be a JSON object.`);
 	const record = value as Partial<ScheduleRecord>;
-	if (record.schemaVersion !== 1 || typeof record.id !== "string" || typeof record.name !== "string" || typeof record.cwd !== "string" || typeof record.createdAt !== "string" || typeof record.updatedAt !== "string" || typeof record.paused !== "boolean") throw new Error(`Schedule record '${file}' has invalid required fields.`);
+	if ((record.schemaVersion !== 1 && record.schemaVersion !== 2) || typeof record.id !== "string" || typeof record.name !== "string" || typeof record.cwd !== "string" || typeof record.createdAt !== "string" || typeof record.updatedAt !== "string" || typeof record.paused !== "boolean") throw new Error(`Schedule record '${file}' has invalid required fields.`);
 	validateScheduleId(record.id);
 	if (!record.trigger || typeof record.trigger !== "object" || !record.target || typeof record.target !== "object") throw new Error(`Schedule record '${file}' has invalid trigger or target.`);
 	if (record.overlap !== "skip" || (record.catchUp !== "none" && record.catchUp !== "latest")) throw new Error(`Schedule record '${file}' has unsupported policy fields.`);
@@ -311,11 +321,15 @@ function parseSchedule(value: unknown, file: string): ScheduleRecord {
 		if (typeof record.trigger.at !== "string" || (record.trigger.nextRunAt !== undefined && typeof record.trigger.nextRunAt !== "string")) throw new Error(`Schedule record '${file}' has an invalid one-shot trigger.`);
 	} else if (record.trigger.kind === "interval") {
 		if (typeof record.trigger.every !== "string" || typeof record.trigger.everyMs !== "number" || typeof record.trigger.anchorAt !== "string" || typeof record.trigger.nextRunAt !== "string") throw new Error(`Schedule record '${file}' has an invalid interval trigger.`);
+	} else if (record.trigger.kind === "calendar") {
+		restoreCalendarTrigger(record.trigger); // Validate without rewriting during read-only list/show.
 	} else throw new Error(`Schedule record '${file}' has an unsupported trigger.`);
 	if (record.sessionOnly !== undefined && typeof record.sessionOnly !== "boolean") throw new Error(`Schedule record '${file}' has invalid sessionOnly.`);
 	if (record.quiet !== undefined && typeof record.quiet !== "boolean") throw new Error(`Schedule record '${file}' has invalid quiet.`);
 	if (record.sessionOnly === true && (typeof record.ownerSessionFile !== "string" || !record.ownerSessionFile.trim())) throw new Error(`Schedule record '${file}' is session-only but has no owner session file.`);
-	return { ...record, target: parseScheduleTarget(record.target, file) } as ScheduleRecord;
+	const target = parseScheduleTarget(record.target, file);
+	if ((record.schemaVersion === 2) !== (target.missionId !== undefined)) throw new Error(`Schedule record '${file}' requires schemaVersion 2 exactly when missionId is present.`);
+	return { ...record, target } as ScheduleRecord;
 }
 
 class ScheduleStore {
@@ -397,11 +411,14 @@ function hasPendingScheduleWork(schedule: ScheduleRecord): boolean {
 	return schedule.activeRunId !== undefined || schedule.trigger.nextRunAt !== undefined;
 }
 
-function nextAfter(trigger: ScheduleTrigger, plannedAt: number, now: number): string | undefined {
-	if (trigger.kind === "once") return undefined;
-	let next = plannedAt + trigger.everyMs;
-	while (next <= now) next += trigger.everyMs;
-	return timestamp(next);
+function nextAfter(trigger: ScheduleTrigger, plannedAt: number, now: number): ScheduleTrigger {
+	if (trigger.kind === "once") return { ...trigger, nextRunAt: undefined };
+	if (trigger.kind === "calendar") return {
+		...trigger,
+		...nextCalendarOccurrence(trigger, Math.max(plannedAt, now), calendarDateAfter(trigger, plannedAt, trigger.nextLocalDate)),
+	};
+	const next = plannedAt + (Math.floor(Math.max(0, now - plannedAt) / trigger.everyMs) + 1) * trigger.everyMs;
+	return { ...trigger, nextRunAt: timestamp(next) };
 }
 
 function nextRunAt(schedule: ScheduleRecord): number | undefined {
@@ -414,8 +431,15 @@ function nextRunAt(schedule: ScheduleRecord): number | undefined {
 
 function duePlannedAt(schedule: ScheduleRecord, now: number): number | undefined {
 	const next = nextRunAt(schedule);
-	if (next === undefined || next > now || schedule.catchUp !== "latest" || schedule.trigger.kind !== "interval") return next;
-	return next + Math.floor((now - next) / schedule.trigger.everyMs) * schedule.trigger.everyMs;
+	if (next === undefined || next > now || schedule.catchUp !== "latest") return next;
+	if (schedule.trigger.kind === "calendar") return Date.parse(latestCalendarOccurrence(schedule.trigger, now, schedule.trigger.nextLocalDate)!.nextRunAt);
+	if (schedule.trigger.kind === "interval") return next + Math.floor((now - next) / schedule.trigger.everyMs) * schedule.trigger.everyMs;
+	return next;
+}
+
+function triggerLabel(trigger: ScheduleTrigger): string {
+	if (trigger.kind === "calendar") return `every ${trigger.every}${trigger.on ? ` (${trigger.on.join(", ")})` : ""} at ${trigger.at} ${trigger.timezone}`;
+	return trigger.kind === "once" ? `at ${trigger.at}` : `every ${trigger.every}`;
 }
 
 function textResult(text: string, schedules?: ScheduleRecord[], runs?: ScheduleRunRecord[], isError = false): AgentToolResult<Details> {
@@ -434,18 +458,20 @@ function publicScheduleRecord(schedule: ScheduleRecord): PublicScheduleRecord {
 
 function targetLabel(target: ScheduleTarget): string {
 	const preview = previewSimpleWorkflowRun(target.workflowScript);
-	return preview?.agent ? `workflowScript -> agent ${preview.agent}` : "workflowScript (dynamic)";
+	return preview?.agent ? `workflow -> agent ${preview.agent}` : "workflow (dynamic)";
 }
 
 function sanitizeTarget(params: SubagentParamsLike): { target?: ScheduleTarget; error?: string } {
-	if (params.tasks || params.chain) return { error: "Recurring schedules require workflowScript; legacy tasks and chain inputs are unsupported." };
-	if (params.agent !== undefined || params.task !== undefined) return { error: "schedule.create requires workflowScript. Use workflowScript: \"return runs.run('main', { agent, task })\"." };
-	if (typeof params.workflowScript !== "string" || !params.workflowScript.trim()) return { error: "schedule.create requires a non-empty workflowScript." };
+	if (params.tasks || params.chain) return { error: "Recurring schedules require a workflow script; legacy tasks and chain inputs are unsupported." };
+	if (params.agent !== undefined || params.task !== undefined) return { error: "schedule.create requires workflow: true or a workflow script path, e.g. a ```js workflow block containing return runs.run('main', { agent, task })." };
+	if (typeof params.workflowScript !== "string" || !params.workflowScript.trim()) return { error: "schedule.create requires workflow: true or a workflow script path." };
 	if (params.context === "fork") return { error: "Scheduled runs require fresh context." };
 	if (params.async === false) return { error: "Scheduled runs are always async." };
 	let baseRef: string | undefined;
+	let missionId: string | undefined;
 	try {
 		baseRef = normalizeWorktreeBaseRef(params.baseRef);
+		missionId = params.missionId === undefined ? undefined : validateMissionId(params.missionId);
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };
 	}
@@ -453,7 +479,7 @@ function sanitizeTarget(params: SubagentParamsLike): { target?: ScheduleTarget; 
 	if (acceptanceErrors.length) return { error: acceptanceErrors.join(" ") };
 	const normalizedArgs = normalizeWorkflowArgs(params.args);
 	if ("error" in normalizedArgs) return { error: normalizedArgs.error };
-	return { target: { workflowScript: params.workflowScript.trim(), args: deepFreezeWorkflowArgs(normalizedArgs.args), ...(baseRef === undefined ? {} : { baseRef }) } };
+	return { target: { workflowScript: params.workflowScript.trim(), args: deepFreezeWorkflowArgs(normalizedArgs.args), ...(baseRef === undefined ? {} : { baseRef }), ...(missionId === undefined ? {} : { missionId }) } };
 }
 
 function executionParams(schedule: ScheduleRecord, quiet = false): SubagentParamsLike {
@@ -462,7 +488,7 @@ function executionParams(schedule: ScheduleRecord, quiet = false): SubagentParam
 		async: true,
 		context: "fresh",
 		cwd: schedule.cwd,
-		mission: false,
+		...(schedule.target.missionId === undefined ? { mission: false as const } : {}),
 		// Scheduled fires have no operator watching, so completions must name the origin.
 		scheduleOrigin: { id: schedule.id, ...(schedule.name ? { name: schedule.name } : {}), ...(quiet ? { quiet: true } : {}) },
 		...(schedule.timeoutMs === undefined ? {} : { timeoutMs: schedule.timeoutMs }),
@@ -615,17 +641,21 @@ export class ScheduledRunManager {
 		if (target.error) return textResult(target.error, undefined, undefined, true);
 		const at = params.at?.trim();
 		const every = params.every?.trim();
-		if (Boolean(at) === Boolean(every)) return textResult("schedule.create requires exactly one trigger: at or every.", undefined, undefined, true);
+		const calendar = every === "day" || every === "week";
+		if (!calendar && Boolean(at) === Boolean(every)) return textResult("schedule.create requires exactly one trigger: at or every.", undefined, undefined, true);
 		if (params.overlap !== undefined && params.overlap !== "skip") return textResult("This first recurring slice supports overlap='skip' only.", undefined, undefined, true);
 		if (params.catchUp !== undefined && params.catchUp !== "none" && params.catchUp !== "latest") return textResult("catchUp must be 'none' or 'latest'.", undefined, undefined, true);
-		if (params.missionId !== undefined || params.mission !== undefined || params.missionUpdate !== undefined || params.missionStatus !== undefined || params.missionScope !== undefined) return textResult("Mission attachment is deferred from this first schedule slice.", undefined, undefined, true);
-		if (params.on !== undefined || params.timezone !== undefined || every === "day" || every === "week" || every === "month" || every === "year") return textResult("Calendar schedules are deferred from this first safe slice. Use a fixed interval such as every:'24h' or every:'7d'.", undefined, undefined, true);
+		if (params.mission !== undefined || params.missionUpdate !== undefined || params.missionStatus !== undefined || params.missionScope !== undefined) return textResult("Schedules accept only an existing missionId; mission creation and updates are unsupported.", undefined, undefined, true);
+		if (!calendar && (params.on !== undefined || params.timezone !== undefined)) return textResult("on and timezone require every:'day' or every:'week'.", undefined, undefined, true);
 		if (params.quiet !== undefined && typeof params.quiet !== "boolean") return textResult("quiet must be a boolean.", undefined, undefined, true);
-		if (at && params.quiet === true) return textResult("quiet is only supported for recurring schedules.", undefined, undefined, true);
+		if (!calendar && at && params.quiet === true) return textResult("quiet is only supported for recurring schedules.", undefined, undefined, true);
 		const sessionOnly = params.sessionOnly === true;
 		if (sessionOnly && params.cwd !== undefined && !samePath(params.cwd, ctx.cwd)) return textResult("sessionOnly schedules cannot use an explicit cross-project cwd.", undefined, undefined, true);
 		const ownerSessionFile = sessionOnly ? ctx.sessionManager.getSessionFile() : undefined;
 		if (sessionOnly && !ownerSessionFile) return textResult("sessionOnly schedules require a persisted current session.", undefined, undefined, true);
+		if (target.target!.missionId !== undefined) {
+			readMission(resolveMissionStoreLocation({ projectRoot: path.resolve(params.cwd ?? ctx.cwd), ...(this.deps.config.missions ? { config: this.deps.config.missions } : {}) }), target.target!.missionId);
+		}
 		const sessionId = ctx.sessionManager.getSessionId() ?? "unknown";
 		if (this.deps.resolveCapabilityCeiling?.(sessionId)) return textResult("Cannot persist a schedule while a capability ceiling is active.", undefined, undefined, true);
 		const pendingCount = store.list().filter(hasPendingScheduleWork).length;
@@ -635,7 +665,10 @@ export class ScheduledRunManager {
 		if (store.ids().includes(id)) return textResult(`Schedule '${id}' already exists.`, undefined, undefined, true);
 		const now = this.now();
 		let trigger: ScheduleTrigger;
-		if (at) {
+		if (calendar) {
+			const rule = normalizeCalendarRule({ every, at, on: params.on, timezone: params.timezone });
+			trigger = { kind: "calendar", ...rule, ...nextCalendarOccurrence(rule, now) };
+		} else if (at) {
 			const planned = parseScheduledRunTime(at, now);
 			trigger = { kind: "once", at, nextRunAt: timestamp(planned) };
 		} else {
@@ -643,7 +676,8 @@ export class ScheduledRunManager {
 			trigger = { kind: "interval", every: every!, everyMs, anchorAt: timestamp(now), nextRunAt: timestamp(now + everyMs) };
 		}
 		const schedule: ScheduleRecord = {
-			schemaVersion: 1,
+			// Older readers ignore unknown target fields; they must reject mission-bound definitions.
+			schemaVersion: target.target!.missionId === undefined ? 1 : 2,
 			id,
 			name: params.name?.trim() || targetLabel(target.target!),
 			cwd: path.resolve(params.cwd ?? ctx.cwd),
@@ -654,25 +688,25 @@ export class ScheduledRunManager {
 			...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }),
 			paused: false,
 			...(sessionOnly ? { sessionOnly: true, ownerSessionFile: path.resolve(ownerSessionFile!) } : {}),
-			...(trigger.kind === "interval" && params.quiet === true ? { quiet: true } : {}),
+			...(trigger.kind !== "once" && params.quiet === true ? { quiet: true } : {}),
 			createdAt: timestamp(now),
 			updatedAt: timestamp(now),
 		};
 		store.write(schedule);
 		store.appendEvent(schedule, "schedule.created");
 		this.arm(schedule, store);
-		return textResult(`Created schedule ${id}.\nName: ${schedule.name}\nTrigger: ${at ? `at ${at}` : `every ${every}`}\nSession only: ${schedule.sessionOnly === true ? "yes" : "no"}\nQuiet: ${schedule.quiet === true ? "yes" : "no"}\nNext: ${schedule.trigger.nextRunAt}\nTarget: ${targetLabel(schedule.target)}`, [schedule]);
+		return textResult(`Created schedule ${id}.\nName: ${schedule.name}\nTrigger: ${triggerLabel(trigger)}\nSession only: ${schedule.sessionOnly === true ? "yes" : "no"}\nQuiet: ${schedule.quiet === true ? "yes" : "no"}\nNext: ${schedule.trigger.nextRunAt}\nTarget: ${targetLabel(schedule.target)}${schedule.target.missionId === undefined ? "" : `\nMission: ${schedule.target.missionId}`}`, [schedule]);
 	}
 
 	private list(): AgentToolResult<Details> {
 		const schedules = this.requireStore().list().sort((a, b) => (a.trigger.nextRunAt ?? "").localeCompare(b.trigger.nextRunAt ?? ""));
 		if (!schedules.length) return textResult("No project schedules.", []);
-		return textResult([`Project schedules: ${schedules.length}`, ...schedules.map((item) => `- ${item.id} | ${item.paused ? "paused" : item.activeRunId ? "running" : "scheduled"} | ${item.trigger.nextRunAt ?? "no next run"} | ${item.sessionOnly === true ? "session-only" : "project"} | ${item.name}`)].join("\n"), schedules);
+		return textResult([`Project schedules: ${schedules.length}`, ...schedules.map((item) => `- ${item.id} | ${item.paused ? "paused" : item.activeRunId ? "running" : "scheduled"} | ${item.trigger.nextRunAt ?? "no next run"} | ${item.sessionOnly === true ? "session-only" : "project"} | ${item.name}${item.target.missionId === undefined ? "" : ` | mission ${item.target.missionId}`}`)].join("\n"), schedules);
 	}
 
 	private show(params: SubagentParamsLike): AgentToolResult<Details> {
 		const schedule = this.resolve(params);
-		return textResult([`Schedule: ${schedule.id}`, `Name: ${schedule.name}`, `State: ${schedule.paused ? "paused" : schedule.activeRunId ? "running" : "scheduled"}`, `Session only: ${schedule.sessionOnly === true ? "yes" : "no"}`, `Quiet: ${schedule.quiet === true ? "yes" : "no"}`, `Target: ${targetLabel(schedule.target)}`, `CWD: ${shortenPath(schedule.cwd)}`, `Next: ${schedule.trigger.nextRunAt ?? "none"}`, `Catch up: ${schedule.catchUp}`, schedule.activeRunId ? `Active run: ${schedule.activeRunId}` : undefined].filter(Boolean).join("\n"), [schedule]);
+		return textResult([`Schedule: ${schedule.id}`, `Name: ${schedule.name}`, `State: ${schedule.paused ? "paused" : schedule.activeRunId ? "running" : "scheduled"}`, `Session only: ${schedule.sessionOnly === true ? "yes" : "no"}`, `Quiet: ${schedule.quiet === true ? "yes" : "no"}`, `Target: ${targetLabel(schedule.target)}`, schedule.target.missionId === undefined ? undefined : `Mission: ${schedule.target.missionId}`, `CWD: ${shortenPath(schedule.cwd)}`, `Trigger: ${triggerLabel(schedule.trigger)}`, `Next: ${schedule.trigger.nextRunAt ?? "none"}`, `Catch up: ${schedule.catchUp}`, schedule.activeRunId ? `Active run: ${schedule.activeRunId}` : undefined].filter(Boolean).join("\n"), [schedule]);
 	}
 
 	private history(params: SubagentParamsLike): AgentToolResult<Details> {
@@ -701,11 +735,17 @@ export class ScheduledRunManager {
 			return textResult(`Skipped schedule ${schedule.id}: current session is not its owner.`, [schedule]);
 		}
 		if (params.quiet !== undefined && typeof params.quiet !== "boolean") return textResult("quiet must be a boolean.", undefined, undefined, true);
+		const manualTrigger = schedule.trigger;
 		const run = await this.launch(store, schedule, this.now(), "manual", false, params.quiet === true);
 		const updated = store.get(schedule.id);
 		if (run.state === "running") {
 			const now = this.now();
-			if (updated.trigger.kind === "interval") updated.trigger.nextRunAt = timestamp(now + updated.trigger.everyMs);
+			if (updated.trigger.kind === "calendar") {
+				if (manualTrigger.kind !== "calendar") throw new Error("Schedule trigger changed during manual launch.");
+				const consumed = latestCalendarOccurrence(manualTrigger, now, manualTrigger.nextLocalDate)?.nextRunAt ?? manualTrigger.nextRunAt;
+				const advanced = nextAfter(manualTrigger, Date.parse(consumed), now) as CalendarTrigger;
+				if (advanced.nextLocalDate > updated.trigger.nextLocalDate) updated.trigger = advanced;
+			} else if (updated.trigger.kind === "interval") updated.trigger.nextRunAt = timestamp(now + updated.trigger.everyMs);
 			else updated.trigger.nextRunAt = undefined;
 			updated.updatedAt = timestamp(now);
 			store.write(updated);
@@ -752,6 +792,14 @@ export class ScheduledRunManager {
 
 	private restoreOne(store: ScheduleStore, schedule: ScheduleRecord, notBefore?: number, rearm = true): void {
 		if (!scheduleBelongsToSession(schedule, this.requireContext(store))) return;
+		if (schedule.trigger.kind === "calendar") {
+			const refreshed = restoreCalendarTrigger(schedule.trigger);
+			if (JSON.stringify(refreshed) !== JSON.stringify(schedule.trigger)) {
+				schedule.trigger = refreshed;
+				schedule.updatedAt = timestamp(this.now());
+				store.write(schedule);
+			}
+		}
 		if (schedule.activeRunId) {
 			const run = store.history(schedule.id).find((item) => item.id === schedule.activeRunId);
 			if (run?.state === "running" && run.asyncId) this.observedAsyncIds.add(run.asyncId);
@@ -814,9 +862,9 @@ export class ScheduledRunManager {
 			const schedule = store.find(id);
 			if (!schedule) return;
 			const now = this.now();
-			const planned = schedule.trigger.kind === "interval" ? duePlannedAt(schedule, now) : undefined;
-			const notBefore = planned !== undefined && planned <= now ? Date.parse(nextAfter(schedule.trigger, planned, now)!) : undefined;
-			this.restoreOne(store, schedule, notBefore, schedule.trigger.kind === "interval");
+			const planned = schedule.trigger.kind !== "once" ? duePlannedAt(schedule, now) : undefined;
+			const notBefore = planned !== undefined && planned <= now ? Date.parse(nextAfter(schedule.trigger, planned, now).nextRunAt!) : undefined;
+			this.restoreOne(store, schedule, notBefore, schedule.trigger.kind !== "once");
 		} catch (error) {
 			console.warn(`[pi-subagents] Scheduled run '${id}' could not be restored after fire failure: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -840,12 +888,13 @@ export class ScheduledRunManager {
 	private async launch(store: ScheduleStore, schedule: ScheduleRecord, planned: number, dueReason: ScheduleRunRecord["dueReason"], advance: boolean, quiet?: boolean): Promise<ScheduleRunRecord> {
 		const now = this.now();
 		const nextRunAtBeforeClaim = schedule.trigger.nextRunAt;
+		const nextLocalDateBeforeClaim = schedule.trigger.kind === "calendar" ? schedule.trigger.nextLocalDate : undefined;
 		const run: ScheduleRunRecord = { schemaVersion: 1, id: this.randomId(), scheduleId: schedule.id, plannedAt: timestamp(planned), dueReason, state: "running", startedAt: timestamp(now) };
 		if (schedule.activeRunId) {
 			run.state = "skipped";
 			run.completedAt = timestamp(now);
 			if (advance) {
-				schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+				schedule.trigger = nextAfter(schedule.trigger, planned, now);
 				schedule.updatedAt = timestamp(now);
 				store.write(schedule);
 			}
@@ -865,7 +914,7 @@ export class ScheduledRunManager {
 			run.state = "skipped";
 			run.completedAt = timestamp(now);
 			if (advance) {
-				schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+				schedule.trigger = nextAfter(schedule.trigger, planned, now);
 				schedule.updatedAt = timestamp(now);
 				store.write(schedule);
 			}
@@ -875,7 +924,7 @@ export class ScheduledRunManager {
 		}
 		schedule.activeRunId = run.id;
 		schedule.lastRunId = run.id;
-		if (advance) schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+		if (advance) schedule.trigger = nextAfter(schedule.trigger, planned, now);
 		schedule.updatedAt = timestamp(now);
 		store.write(schedule);
 		store.writeRun(schedule, run, "schedule.run.started");
@@ -895,7 +944,16 @@ export class ScheduledRunManager {
 			run.error = error instanceof Error ? error.message : String(error);
 			const latest = store.get(schedule.id);
 			latest.activeRunId = undefined;
-			if (!advance && nextRunAtBeforeClaim) latest.trigger.nextRunAt = nextRunAtBeforeClaim;
+			if (!advance && nextRunAtBeforeClaim) {
+				if (latest.trigger.kind === "calendar") {
+					// An overlapping timer may have advanced both cursor fields while
+					// this manual attachment was pending. Failure satisfies neither.
+					if (nextLocalDateBeforeClaim !== undefined) {
+						latest.trigger.nextLocalDate = nextLocalDateBeforeClaim;
+						latest.trigger.nextRunAt = nextRunAtBeforeClaim;
+					}
+				} else latest.trigger.nextRunAt = nextRunAtBeforeClaim;
+			}
 			latest.updatedAt = timestamp(this.now());
 			store.write(latest);
 			store.writeRun(latest, run, "schedule.run.failed");
@@ -919,7 +977,7 @@ export class ScheduledRunManager {
 				state: "skipped",
 				completedAt: timestamp(now),
 			};
-			schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+			schedule.trigger = nextAfter(schedule.trigger, planned, now);
 			store.writeRun(schedule, skipped, "schedule.skipped_overlap");
 		}
 		if (run.asyncId) this.observedAsyncIds.delete(run.asyncId);
@@ -944,7 +1002,7 @@ export class ScheduledRunManager {
 			state: "missed",
 			completedAt: timestamp(this.now()),
 		};
-		schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, this.now());
+		schedule.trigger = nextAfter(schedule.trigger, planned, this.now());
 		schedule.updatedAt = timestamp(this.now());
 		store.write(schedule);
 		store.writeRun(schedule, run, "schedule.missed");

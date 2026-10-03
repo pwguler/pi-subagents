@@ -1,5 +1,5 @@
 import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
-import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
+import { checkModelScope, SCOPED_PATTERN, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 
 export type { AvailableModelInfo };
 
@@ -10,15 +10,23 @@ export interface ModelSelectionEvidence {
 
 export { splitThinkingSuffix };
 
-/** Aliases apply only to the resolved launch candidate (without its thinking suffix) and the exact raw response ID. */
+/**
+ * Aliases apply only to the resolved launch candidate (without its thinking suffix) and the exact raw response ID.
+ * When the child's live selection is a Pi virtual model, assistant messages name the physical model it dispatched
+ * to, so the virtual selection's provider/id is compared exactly with the launch candidate instead.
+ */
 export function formatSubagentModelVerificationError(
 	expectedModel: string,
 	observedModel: string,
 	availableModels: AvailableModelInfo[] | undefined,
 	modelResponseAliases?: Record<string, string[]>,
+	observedVirtualModel?: string,
 ): string | undefined {
 	if (!availableModels || availableModels.length === 0) return undefined;
 	const expectedBase = splitThinkingSuffix(expectedModel).baseModel;
+	if (observedVirtualModel !== undefined) {
+		return observedVirtualModel === expectedBase ? undefined : `model_verification_failed: native Pi child selected virtual model '${observedVirtualModel}', but the launch candidate was '${expectedModel}'. modelResponseAliases does not apply to a virtual-model selection.`;
+	}
 	if (modelResponseAliases && Object.hasOwn(modelResponseAliases, expectedBase)
 		&& modelResponseAliases[expectedBase]?.includes(observedModel)) return undefined;
 	const observedBase = splitThinkingSuffix(observedModel).baseModel;
@@ -48,6 +56,23 @@ export function normalizeParentModel(model: unknown): ParentModel | undefined {
 	if (typeof candidate.provider !== "string" || typeof candidate.id !== "string") return undefined;
 	if (!candidate.provider || !candidate.id) return undefined;
 	return { provider: candidate.provider, id: candidate.id };
+}
+
+/**
+ * Provider/id ids of the host session's scoped-model snapshot (`ctx.scopedModels`).
+ * Pi reports an empty set when the session is unscoped (nothing configured, or no
+ * pattern matched), and then allows every model; `scoped` narrows that to `inherit`.
+ */
+export function scopedModelIdsFromContext(ctx: { scopedModels?: ReadonlyArray<{ model?: unknown }> }): string[] {
+	const scoped = ctx.scopedModels;
+	if (!Array.isArray(scoped)) return [];
+	const ids: string[] = [];
+	for (const entry of scoped) {
+		const model = entry?.model;
+		const normalized = normalizeParentModel(model);
+		if (normalized) ids.push(`${normalized.provider}/${normalized.id}`);
+	}
+	return ids;
 }
 
 /**
@@ -267,12 +292,15 @@ function configuredScopes(scope: ModelScopeCheckRule | ModelScopeCheckRule[] | u
 	return scope ? (Array.isArray(scope) ? scope : [scope]) : [];
 }
 
-function throwForUnresolvedEnforcedInheritScope(scope: ModelScopeCheckRule | ModelScopeCheckRule[] | undefined, includeMixed = false): void {
-	const unresolvedInheritScope = configuredScopes(scope)
-		.find((entry) => entry.enforce === true && (includeMixed ? entry.allow?.includes(INHERIT_MODEL) : entry.allow?.length === 1 && entry.allow[0] === INHERIT_MODEL));
-	if (!unresolvedInheritScope) return;
-	const origin = unresolvedInheritScope.origin ?? "modelScope";
-	throw new Error(`Cannot enforce subagent model scope (${origin}): 'inherit' requires a current parent session model.`);
+function throwForUnresolvedEnforcedReservedScope(scope: ModelScopeCheckRule | ModelScopeCheckRule[] | undefined, includeMixed = false): void {
+	const unresolvedReservedScope = configuredScopes(scope)
+		.find((entry) => entry.enforce === true && (includeMixed
+			? entry.allow?.some((pattern) => pattern === INHERIT_MODEL || pattern === SCOPED_PATTERN)
+			: entry.allow?.length === 1 && (entry.allow[0] === INHERIT_MODEL || entry.allow[0] === SCOPED_PATTERN)));
+	if (!unresolvedReservedScope) return;
+	const origin = unresolvedReservedScope.origin ?? "modelScope";
+	const token = unresolvedReservedScope.allow?.includes(INHERIT_MODEL) ? INHERIT_MODEL : SCOPED_PATTERN;
+	throw new Error(`Cannot enforce subagent model scope (${origin}): '${token}' requires a current parent session model.`);
 }
 
 function enforceModelScopes(
@@ -316,7 +344,7 @@ export function resolveSubagentModelOverride(
 ): string | undefined {
 	const trimmed = typeof requestedModel === "string" ? requestedModel.trim() : "";
 	const explicit = trimmed && trimmed !== INHERIT_MODEL ? trimmed : undefined;
-	if (!parentModel) throwForUnresolvedEnforcedInheritScope(options?.scope, explicit === undefined || options?.source === "inherited");
+	if (!parentModel) throwForUnresolvedEnforcedReservedScope(options?.scope, explicit === undefined || options?.source === "inherited");
 	let resolved: string | undefined;
 	let resolvedFromRegistry = explicit === undefined;
 	if (explicit === undefined) {
@@ -407,7 +435,7 @@ export function resolveModelSelection(
 	preferredProvider?: string,
 	options?: ResolveModelSelectionOptions,
 ): ModelSelectionEvidence {
-	if (!model) throwForUnresolvedEnforcedInheritScope(options?.scope, true);
+	if (!model) throwForUnresolvedEnforcedReservedScope(options?.scope, true);
 	const origin = options?.origin ?? (options?.primaryModelFromParent ? "inherited" : "configured");
 	const requestedModel = origin === "inherited" ? undefined : model;
 	const scopes = configuredScopes(options?.scope);

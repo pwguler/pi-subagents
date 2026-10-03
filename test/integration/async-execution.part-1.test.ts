@@ -611,6 +611,62 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	describe("with Pi's built-in MCP", () => {
+		const host = {
+			events: { emit() {} },
+			getCommands: () => [{ name: "mcp", sourceInfo: { path: "builtin:mcp" } }],
+			getAllTools: () => [["docs", "search"], ["docs", "fetch"], ["ext", "ping"]].map(([server, tool]) => ({ name: `mcp__${server}__${tool}`, exposure: "codemode", namespace: { name: `mcp__${server}` } })),
+			getMcpServers: () => [{ name: "ext" }],
+		};
+		const runForeground = (agent: ReturnType<typeof makeAgent>, projectTrusted?: boolean) => runSync(tempDir, [agent], agent.name, "Use MCP", { runtimeSnapshotHost: host, acceptance: false, projectTrusted });
+		const runBackground = async (agent: ReturnType<typeof makeAgent>) => {
+			const id = `async-builtin-mcp-${Date.now().toString(36)}`;
+			executeAsyncSingle(id, {
+				agent: agent.name, task: "Use MCP", agentConfig: agent,
+				ctx: { pi: host, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2, acceptance: false,
+			});
+			assert.equal((await readAsyncPayload(id)).success, true);
+			const callFile = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort().at(-1)!;
+			return (JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as MockPiCallRecord).launch!;
+		};
+
+		it("gives foreground and background children exactly the selected tools", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["docs/search"] });
+			mockPi.onCall({ output: "foreground done" });
+			assert.equal((await runForeground(agent)).exitCode, 0);
+			const foreground = mockPi.sessions.at(-1)!.launch;
+			assert.deepEqual(foreground.builtinMcpTools, [{ name: "mcp__docs__search", selector: "docs/search" }]);
+			assert.ok(foreground.tools?.includes("mcp__docs__search"));
+
+			mockPi.onCall({ output: "background done" });
+			const background = await runBackground(agent);
+			assert.deepEqual(background.builtinMcpTools, [{ name: "mcp__docs__search", selector: "docs/search" }]);
+			assert.ok(background.tools?.includes("mcp__docs__search"));
+			assert.equal(background.processEnv?.MCP_DIRECT_TOOLS, "__none__");
+		});
+
+		it("grants extension-registered servers only to background children", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["ext"] });
+			await assert.rejects(runForeground(agent), /extensions registered \(ext\)\. Only background children \(async: true\) load those extensions/);
+
+			mockPi.onCall({ output: "background done" });
+			const background = await runBackground(agent);
+			assert.deepEqual(background.builtinMcpTools, [{ name: "mcp__ext__ping", selector: "ext" }]);
+			assert.equal(background.ambientExtensions, true);
+		});
+
+		it("counts a project's .pi/mcp.json for foreground children only when the project is trusted", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["ext"] });
+			fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+			fs.writeFileSync(path.join(tempDir, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { ext: { command: "ext-mcp" } } }));
+			await assert.rejects(runForeground(agent, false), /extensions registered \(ext\)/);
+			mockPi.onCall({ output: "foreground done" });
+			assert.equal((await runForeground(agent, true)).exitCode, 0);
+		});
+	});
+
 	it("matches preflight launch and definition digests for executor-launched async runs with the Intercom bridge active", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const agentName = `bridge-async-${Date.now().toString(36)}`;
 		const task = "Compare bridged async launch identity.";
@@ -990,6 +1046,20 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(outputPath?.startsWith(`${expectedDir}${path.sep}`));
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "async session artifact");
 		assert.equal(fs.existsSync(path.join(tempDir, ".pi/subagents", "artifacts")), false);
+	});
+
+	it("launches foreground and background children with the parent session's project trust", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const executor = makeAsyncExecutor([makeAgent("worker")]);
+		const ctx = { ...makeMinimalCtx(tempDir), isProjectTrusted: () => false };
+		mockPi.onCall({ output: "foreground done" });
+		const foreground = await executor.execute("trust-foreground", { agent: "worker", task: "Inspect", acceptance: false }, new AbortController().signal, undefined, ctx);
+		assert.equal(foreground.isError, undefined, foreground.content[0]?.text);
+		mockPi.onCall({ output: "background done" });
+		const background = await executor.execute("trust-background", { agent: "worker", task: "Inspect", async: true, acceptance: false }, new AbortController().signal, undefined, ctx) as AsyncExecutionResult;
+		await readAsyncPayload(background.details.asyncId!);
+		const trust = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")).launch.projectTrusted);
+		assert.deepEqual(trust, [false, false]);
 	});
 
 	it("persists async capability ceiling audit to status, results, events, and metadata", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

@@ -348,7 +348,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	// Every notice that wakes the parent goes through parentWake; the watchdog wakes only inside a run.
 	const parentWake = createParentWake(pi);
-	const wakingPi = { events: pi.events, sendMessage: parentWake.sendMessage, on: pi.on };
+	const wakingPi = { events: pi.events, sendMessage: parentWake.sendMessage, isHeld: parentWake.isHeld, on: pi.on };
 	const supervisorChannel = createNativeSupervisorChannel(pi, state, {
 		// Owner states are created only by scheduled execution, which loads the executor first.
 		getCurrentOwnerStates: () => executor?.getCurrentSupervisorOwnerStates() ?? [],
@@ -725,6 +725,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		try {
+			// The run is still active here, so its signal tells a user stop (Esc) apart from a finished or failed run.
+			// Pi skips agent_before_settle after an abort. Background runs keep going, but they must not restart the parent.
+			if (ctx.hasUI && ctx.signal?.aborted) {
+				parentWake.userAborted();
+				const active = [...state.asyncJobs.values()].filter((job) => job.status === "queued" || job.status === "running").length;
+				if (active > 0) ctx.ui.notify(`${active} background subagent ${active === 1 ? "run is" : "runs are"} still active · /subagents-stop to stop ${active === 1 ? "it" : "them"}`, "info");
+			}
 			// A headless host may dispose the session as soon as this turn settles, so hand
 			// finished results to Pi now; Pi runs the queued completion turn after agent_end.
 			// A failed drain rejects without this step so its deadline stays exact.
@@ -1086,6 +1093,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				if (Date.now() < deadline) compactionResumeTimer = setTimeout(resumeWhenIdle, COMPACTION_RESUME_POLL_MS);
 				return;
 			}
+			// Pi's compact() aborts a live run first, which set the user-abort hold; this resume is deliberate.
+			parentWake.releaseHold();
 			parentWake.sendMessage(
 				{
 					customType: "subagent-compaction-resume",

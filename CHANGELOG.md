@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Pressing `Esc` stopped the parent, but a background subagent that finished or asked for input a moment later started a new parent turn, so the agent the user had just stopped kept working. After `Esc`, background results and requests are now added to the session without starting a turn, and the parent sees them with the user's next prompt, with completion notices telling it not to resume the stopped task unless asked. Background runs keep running, and the TUI shows how many are still active and points to `/subagents-stop`.
+- Stopping several background runs meant opening `/subagents-stop` once per run. When two or more current-session async runs are active, the picker now starts with a "stop all" row that stops all of them after one confirmation. Scheduled runs are not paused.
+
 ### Fixed
 
 - When a background run kept failing to read its control inbox, such as the `EPERM` errors seen on Windows, the runner wrote the same stack trace to `runner.stderr.log` on every retry and filled gigabytes in minutes. A repeating failure is now logged once, then as one line per minute with the number of repeats, and logged in full again if it recurs after the inbox becomes readable. Retries continue, so queued requests are still delivered once the inbox is readable. Thanks to [@infectiousstupidity](https://github.com/infectiousstupidity) for the report. ([#2811](https://github.com/nicobailon/pi-subagents/issues/2811))

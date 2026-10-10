@@ -376,7 +376,7 @@ Commands remain owned by the child session. Normal completion with unfinished co
 - It is not a resumable pause; stopped runs should be restarted as new runs.
 - Foreground and nested targets are rejected.
 - Direct id calls execute immediately.
-- `/subagents-stop` without an id opens a selector with confirmation when a TUI is available. Use `↑`/`↓` or `j`/`k` to move through the selector.
+- `/subagents-stop` without an id opens a selector with confirmation when a TUI is available. Use `↑`/`↓` or `j`/`k` to move through the selector. When two or more current-session async runs are active, the first row is "stop all", which stops each of them after one confirmation and leaves scheduled runs alone.
 - In non-TUI contexts the slash command prints exact `subagent({ action: "stop", id })` and `/subagents-stop <id>` commands.
 - Pass a child id to stop one child of a multi-child async run or workflow while the rest continue: `/subagents-stop <run-id> <child-id>` (equivalent to `subagent({ action: "stop", id, childId })`). Child ids come from status output, the async status snapshot, or `/subagents-inspect-rpc` replies. Only pending or running children are stoppable; the request is rejected for anything else instead of widening to a run-level stop.
 - Inactive schedules can appear in the selector, but they are labeled as schedules and route through `schedule.pause`, not `stop`.

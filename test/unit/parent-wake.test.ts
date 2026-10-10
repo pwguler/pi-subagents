@@ -11,7 +11,7 @@ import { currentCompletionOwnerId } from "../../src/shared/completion-owner.ts";
 import { createParentWake, PARENT_WAKE_TEXT } from "../../src/shared/parent-wake.ts";
 import { createNativeSupervisorChannel } from "../../src/intercom/native-supervisor-channel.ts";
 import registerSubagentNotify from "../../src/runs/background/notify.ts";
-import { SUBAGENT_ASYNC_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
+import { SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, type SubagentState } from "../../src/shared/types.ts";
 
 function createHarness(sessionManager: { getSessionId(): string } = SessionManager.inMemory()) {
 	const calls: unknown[][] = [];
@@ -101,6 +101,45 @@ it("holds a pending wake until its run starts, and abandons it only once an idle
 	assert.equal(wake.isPending(), true, "a busy parent may still be in the wake's preflight");
 	setIdle(true);
 	assert.equal(wake.isPending(), false, "an idle parent past the deadline has abandoned the wake");
+});
+
+it("after a user abort, appends waking notices without a wake until the next run starts", () => {
+	const { wake, calls, wakes, setIdle } = createHarness();
+	wake.userAborted();
+	assert.equal(wake.sendMessage(notice("idle"), { triggerTurn: true }), true);
+	setIdle(false);
+	assert.equal(wake.sendMessage(notice("still finishing"), { triggerTurn: true }), true);
+	assert.equal(wake.sendMessage(notice("context"), { triggerTurn: false }), false);
+	assert.deepEqual(calls, [
+		["sendMessage", notice("idle"), { triggerTurn: false }],
+		["sendMessage", notice("still finishing"), { triggerTurn: false }],
+		["sendMessage", notice("context"), { triggerTurn: false }],
+	]);
+	assert.equal(wake.isPending(), false, "a held notice leaves no wake outstanding");
+	setIdle(true);
+	wake.agentStarted();
+	wake.sendMessage(notice("after the next run"), { triggerTurn: true });
+	assert.equal(wakes(), 1);
+});
+
+it("drops a user-abort hold when the session changes, shuts down, or a resume releases it", () => {
+	const manager = SessionManager.inMemory();
+	const { wake, wakes } = createHarness(manager);
+	wake.userAborted();
+	wake.sessionShutdown("quit");
+	wake.sendMessage(notice("after shutdown"), { triggerTurn: true });
+	assert.equal(wakes(), 1);
+	wake.agentStarted();
+	wake.userAborted();
+	manager.newSession();
+	wake.bindSession({ isIdle: () => true, sessionManager: manager } as never);
+	wake.sendMessage(notice("new session"), { triggerTurn: true });
+	assert.equal(wakes(), 2);
+	wake.userAborted();
+	wake.releaseHold();
+	assert.equal(wake.isHeld(), false);
+	wake.sendMessage(notice("during the pending wake"), { triggerTurn: true });
+	assert.equal(wakes(), 2, "releasing the hold keeps the pending wake reservation");
 });
 
 it("shares one idle wake per session with other extensions, such as pi-intercom", () => {
@@ -212,6 +251,90 @@ for (const emptyResponse of [false, true]) it(`starts an idle parent's completio
 			&& Object.values((message as { sections?: Record<string, unknown> }).sections ?? {}).some((value) => value === null));
 		assert.deepEqual(removals, [], "the woken run's second request must not drop hook-set sections");
 		assert.equal(session.getLastAssistantText(), "Handled the child result.");
+	} finally {
+		if (session) await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
+		session?.dispose();
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// Pi's compact() aborts a live run first, so a manual /compact mid-tool also ends the run with an aborted signal.
+for (const stopWith of ["abort", "compact"] as const) it(stopWith === "abort"
+	? "does not restart a parent the user stopped mid-tool until the user prompts again"
+	: "still resumes the parent after a manual /compact that stops a run mid-tool", { timeout: 30_000 }, async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parent-wake-abort-"));
+	const agentDir = path.join(root, "agent");
+	fs.mkdirSync(agentDir);
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	const sessionManager = SessionManager.inMemory(root);
+	const sessionId = sessionManager.getSessionId();
+	const faux = fauxProvider({ provider: "parent-wake-abort", models: [{ id: "local" }], tokensPerSecond: 100_000 });
+	faux.setResponses([
+		() => fauxAssistantMessage(fauxToolCall("slow_tool", {}), { stopReason: "toolUse" }),
+		...Array.from({ length: 6 }, () => () => fauxAssistantMessage("Answered.")),
+	]);
+	const prompts: string[] = [];
+	const notices: string[] = [];
+	let emit = (_event: string, _data: unknown) => {};
+	let stop = () => {};
+	const settingsManager = SettingsManager.inMemory(stopWith === "compact" ? { compaction: { keepRecentTokens: 1 } } : {});
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: root, agentDir, settingsManager,
+		noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+		extensionFactories: [registerSubagentExtension, (api) => {
+			api.registerProvider(faux.provider);
+			emit = (event, data) => api.events.emit(event, data);
+			api.on("before_agent_start", (event) => { prompts.push(event.prompt); });
+			api.on("session_before_compact", (event) => ({
+				compaction: { summary: "Compacted.", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore },
+			}));
+			api.registerTool({ name: "slow_tool", label: "Slow", description: "Wait until aborted", parameters: Type.Object({}), execute(_id, _params, signal) {
+				setImmediate(stop);
+				return new Promise((resolve) => signal?.addEventListener("abort", () => resolve({ content: [{ type: "text", text: "stopped" }], details: {} }), { once: true }));
+			} });
+		}],
+	});
+	const theme = new Proxy({}, { get: () => (...args: unknown[]) => String(args.at(-1) ?? "") });
+	const ignore = () => undefined;
+	const uiContext = {
+		...Object.fromEntries(["select", "confirm", "input", "onTerminalInput", "setStatus", "setWorkingMessage", "setWorkingVisible", "setWorkingIndicator", "setHiddenThinkingLabel", "setWidget", "setFooter", "setHeader", "setTitle", "custom", "pasteToEditor", "setEditorText", "getEditorText", "editor", "addAutocompleteProvider", "setEditorComponent", "getEditorComponent", "getAllThemes", "getTheme", "setTheme", "getToolsExpanded", "setToolsExpanded"].map((name) => [name, ignore])),
+		theme,
+		notify: (text: string) => { notices.push(text); },
+	};
+	// A failed result skips the completion batch window, so it reaches the parent at once.
+	const completion = (id: string) => ({ id, sessionId, completionOwnerId: currentCompletionOwnerId(), success: false, summary: `${id} needs the parent.` });
+	const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+	let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+	try {
+		await resourceLoader.reload();
+		const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: path.join(agentDir, "models.json"), allowModelNetwork: false });
+		({ session } = await createAgentSession({ cwd: root, agentDir, settingsManager, resourceLoader, modelRuntime, model: faux.getModel("local"), sessionManager, noTools: "builtin" }));
+		await session.bindExtensions({ uiContext: uiContext as never });
+		stop = () => { void (stopWith === "abort" ? session!.abort() : session!.compact()); };
+		emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: "still-running", sessionId, asyncDir: path.join(root, "still-running"), agent: "worker", task: "Keep going." });
+		await session.prompt("Start.");
+		if (stopWith === "compact") {
+			for (let waited = 0; waited < 2_000 && !prompts.includes(PARENT_WAKE_TEXT); waited += 50) await settle();
+			assert.deepEqual(prompts, ["Start.", PARENT_WAKE_TEXT], "the compaction resume must wake the parent");
+			return;
+		}
+		assert.equal(session.isIdle, true);
+		assert.ok(notices.some((text) => text.startsWith("1 background subagent run is still active")), notices.join("\n"));
+
+		emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completion("held-child"));
+		await settle();
+		assert.deepEqual(prompts, ["Start."], "a stopped parent must not be restarted by a background result");
+		const notice = (id: string) => String(session!.messages.find((message) => message.role === "custom" && String(message.content).includes(`${id} needs the parent.`))?.content);
+		assert.match(notice("held-child"), /Parent action: The user stopped the parent turn\./, "the held result is recorded for the next prompt without asking to resume");
+
+		await session.prompt("Continue.");
+		emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completion("later-child"));
+		await settle();
+		assert.deepEqual(prompts, ["Start.", "Continue.", PARENT_WAKE_TEXT], "a completed run does not hold wakes");
+		assert.match(notice("later-child"), /Parent action: Read the saved results above and resume the already-authorized parent task/);
 	} finally {
 		if (session) await (session.extensionRunner as unknown as { emit(event: unknown): Promise<unknown> }).emit({ type: "session_shutdown", reason: "quit" });
 		session?.dispose();

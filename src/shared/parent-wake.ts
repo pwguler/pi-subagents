@@ -19,12 +19,19 @@ export interface ParentWake {
 	 * turn is started with sendUserMessage. Pi starts a sendMessage-triggered run without
 	 * before_agent_start (earendil-works/pi#5581), so that run drops every hook-set prompt section.
 	 * Returns true when the message was appended that way: Pi emits no extension message_start for it.
+	 * After userAborted() and until the next run starts, a turn-triggering message is only appended.
 	 */
 	sendMessage(...args: Parameters<ExtensionAPI["sendMessage"]>): boolean;
 	/** True from an idle wake until its run starts or the session shuts down. Past the deadline it holds only while the parent is busy, which may still be the wake's preflight (for example compacting). */
 	isPending(): boolean;
 	bindSession(ctx: Pick<ExtensionContext, "isIdle" | "sessionManager">): void;
 	agentStarted(): void;
+	/** The user stopped the parent run: hold wakes until the next run starts. */
+	userAborted(): void;
+	/** A deliberate resume (manual compaction) drops the hold without touching the shared wake reservation. */
+	releaseHold(): void;
+	/** True while a user abort holds wakes. */
+	isHeld(): boolean;
 	sessionShutdown(reason: string | undefined): void;
 }
 
@@ -32,6 +39,7 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage" | "sendUse
 	let ctx!: Pick<ExtensionContext, "isIdle">;
 	// Captured at bind: Pi's ctx throws once stale, which it can be by session_shutdown.
 	let session: { manager: object; id: string } | undefined;
+	let held = false;
 	// Look the reservation up on every access: another extension may have created this session's entry.
 	const reservation = (): WakeReservation => {
 		// Pi can shut an extension down before session_start binds it; an unbound wake reserved nothing.
@@ -52,6 +60,11 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage" | "sendUse
 				pi.sendMessage(message, options);
 				return false;
 			}
+			if (held) {
+				// Appended now, or at the end of a run still finishing; neither emits an extension message_start.
+				pi.sendMessage(message, { triggerTurn: false });
+				return true;
+			}
 			if (!ctx.isIdle()) {
 				pi.sendMessage(message, options);
 				return false;
@@ -68,12 +81,22 @@ export function createParentWake(pi: Pick<ExtensionAPI, "sendMessage" | "sendUse
 		bindSession(context) {
 			ctx = context;
 			session = { manager: context.sessionManager, id: context.sessionManager.getSessionId() };
+			held = false;
 		},
 		agentStarted() {
 			reservation().sentAt = undefined;
+			held = false;
 		},
+		userAborted() {
+			held = true;
+		},
+		releaseHold() {
+			held = false;
+		},
+		isHeld: () => held,
 		sessionShutdown(reason) {
 			if (reason !== "reload") reservation().sentAt = undefined;
+			held = false;
 		},
 	};
 }

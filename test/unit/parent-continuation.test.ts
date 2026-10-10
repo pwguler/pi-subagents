@@ -104,9 +104,11 @@ it("bounds retries for empty completion wakes without widening authority", async
 
 const handlers = new Map(), sent = [], messages = [];
 let failSend = false;
+let held = false;
 const pi = {
   events: { on: () => () => {} },
   on(name, fn) { handlers.set(name, fn); return () => handlers.delete(name); },
+  isHeld: () => held,
   sendMessage(message, options) {
     if (failSend) throw Error('send failed');
     sent.push({ message, options });
@@ -185,6 +187,13 @@ try {
   assert.equal(blocked.continue, undefined);
   assert.match(blocked.entries[0].content, /^UNHANDLED:/);
   assert.equal(settle(preDraftContext), undefined, 'pre-draft continuation state cannot reset budget');
+  held = true;
+  await deliver();
+  assert.match(sent.at(-1).message.content, /The user stopped the parent turn\./);
+  assistant([{ type: 'text', text: '' }]);
+  assert.equal(settle(), undefined, 'a held notice never revives the stopped task');
+  assert.equal(handlers.has('agent_before_settle'), false);
+  held = false;
   await deliver();
   notifier.bindSession({ getSessionId: () => 'other' });
   assert.equal(settle(), undefined, 'session switch clears acknowledgement state');

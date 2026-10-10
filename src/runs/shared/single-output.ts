@@ -138,12 +138,6 @@ export function injectSingleOutputInstruction(task: string, outputPath: string |
 	return `${task}\n\n---\n**Output:**\n${formatOutputPathInstruction(outputPath, capabilities)}`;
 }
 
-export function injectOutputPathSystemPrompt(systemPrompt: string, outputPath: string | undefined, capabilities?: OutputInstructionCapabilities): string {
-	if (!outputPath) return systemPrompt;
-	const instruction = `Runtime output path override:\n${formatOutputPathInstruction(outputPath, capabilities)}`;
-	return systemPrompt ? `${systemPrompt}\n\n${instruction}` : instruction;
-}
-
 function countLines(text: string): number {
 	if (!text) return 0;
 	const newlineMatches = text.match(/\r\n|\r|\n/g);

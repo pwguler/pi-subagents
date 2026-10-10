@@ -29,7 +29,7 @@ const script = String.raw`
 		registerTool() {}, registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
 	}, { get(target, property) { return property in target ? target[property] : () => undefined; } });
 	const ctx = {
-		cwd: process.cwd(), hasUI: false, model: undefined,
+		cwd: process.cwd(), isIdle() { return false; }, hasUI: false, model: undefined,
 		ui: { setWidget() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } },
 		sessionManager: { getSessionId() { return "lifecycle-session"; }, getSessionFile() { return null; }, getEntries() { return []; } },
 		modelRegistry: { getAvailable() { return []; } },
@@ -59,8 +59,8 @@ describe("extension maintenance lifecycle", () => {
 		assert.equal(result.status, 0, result.stderr);
 		assert.deepEqual(JSON.parse(result.stdout), {
 			atFactory: 0, atStart: 3, atRepeatedStart: 3, atShutdown: 0,
-			inspectorsAtFactory: ["herdr", "ghostty", "lifecycle-inspector"],
-			inspectorsAtShutdown: ["herdr", "ghostty"],
+			inspectorsAtFactory: ["herdr", "ghostty", "tmux", "lifecycle-inspector"],
+			inspectorsAtShutdown: ["herdr", "ghostty", "tmux"],
 		});
 	});
 });

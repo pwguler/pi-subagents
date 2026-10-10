@@ -172,7 +172,9 @@ type StopSelectorTarget = {
 	actionLabel: string;
 };
 
-type StopSelectorResult = { confirmed: boolean; target?: StopSelectorTarget };
+type StopAllTarget = { kind: "all"; ids: string[]; label: string; detail: string; actionLabel: string };
+type StopPickerTarget = StopSelectorTarget | StopAllTarget;
+type StopSelectorResult = { confirmed: boolean; target?: StopPickerTarget };
 
 function commandForTarget(target: StopSelectorTarget): string {
 	return target.kind === "scheduled"
@@ -230,6 +232,13 @@ function stopFallbackText(targets: StopSelectorTarget[]): string {
 	return lines.join("\n");
 }
 
+// Two or more async runs get a first row that stops all of them; schedules are left alone.
+function stopPickerTargets(targets: StopSelectorTarget[]): StopPickerTarget[] {
+	const ids = targets.filter((target) => target.kind === "async").map((target) => target.id);
+	if (ids.length < 2) return targets;
+	return [{ kind: "all", ids, label: `${ids.length} current-session async runs`, detail: ids.join(", "), actionLabel: "stop all" }, ...targets];
+}
+
 function selectForegroundDetachControl(state: SubagentState, requested: string) {
 	const controls = [...state.foregroundControls.values()];
 	if (requested) {
@@ -251,10 +260,10 @@ class SubagentsStopSelector implements Component {
 	private confirming = false;
 	private readonly tui: TUI;
 	private readonly theme: Theme;
-	private readonly targets: StopSelectorTarget[];
+	private readonly targets: StopPickerTarget[];
 	private readonly done: (result: StopSelectorResult) => void;
 
-	constructor(tui: TUI, theme: Theme, targets: StopSelectorTarget[], done: (result: StopSelectorResult) => void) {
+	constructor(tui: TUI, theme: Theme, targets: StopPickerTarget[], done: (result: StopSelectorResult) => void) {
 		this.tui = tui;
 		this.theme = theme;
 		this.targets = targets;
@@ -314,8 +323,9 @@ class SubagentsStopSelector implements Component {
 		lines.push("");
 		if (this.confirming) {
 			const target = this.targets[this.selected]!;
-			lines.push(this.theme.fg("warning", `Confirm: ${target.actionLabel} ${target.id}?`));
+			lines.push(this.theme.fg("warning", target.kind === "all" ? `Confirm: stop all ${target.ids.length} async runs?` : `Confirm: ${target.actionLabel} ${target.id}?`));
 			if (target.kind === "async") lines.push(this.theme.fg("dim", "Stop ends this run; use interrupt for a resumable pause."));
+			if (target.kind === "all") lines.push(this.theme.fg("dim", "Stop ends these runs; scheduled runs are not paused."));
 			lines.push(this.theme.fg("dim", "Enter/Y confirms · N returns · Esc cancels"));
 		} else {
 			lines.push(this.theme.fg("dim", "↑↓/jk select · Enter confirm · Esc cancel"));
@@ -592,14 +602,19 @@ async function runSlashSubagent(
 	}
 }
 
-function slashRunWorkflowScript(key: string, child: Record<string, unknown>): string {
+function slashRunWorkflowScript(key: string, child: SubagentParamsLike): string {
 	return `return runs.run(${JSON.stringify(key)}, ${JSON.stringify(child)})`;
 }
 
 export function registerSlashCommands(
 	pi: ExtensionAPI,
 	state: SubagentState,
-	options: { fleetKeybindings?: FleetKeybindingsConfig; foregroundDetachShortcut?: string } = {},
+	options: {
+		fleetKeybindings?: FleetKeybindingsConfig;
+		foregroundDetachShortcut?: string;
+		/** disabledFeatures "workflow-scripts": /run launches its one child directly instead of through a script. */
+		workflowScriptsDisabled?: boolean;
+	} = {},
 ): { dispose: () => void } {
 	let fleetOpen = false;
 	let disposed = false;
@@ -615,7 +630,7 @@ export function registerSlashCommands(
 	};
 	const showFleet = async (ctx: ExtensionContext) => {
 		state.lastUiContext = ctx;
-		if (!ctx.hasUI) {
+		if (ctx.mode !== "tui") {
 			await runCommand(ctx, { action: "status", view: "fleet" });
 			return;
 		}
@@ -640,7 +655,7 @@ export function registerSlashCommands(
 	});
 
 	pi.registerCommand("run", {
-		description: "Run one subagent through workflowScript: /run agent[output=file] [task] [--bg] [--fork]",
+		description: "Run one subagent through a workflow script: /run agent[output=file] [task] [--bg] [--fork]",
 		getArgumentCompletions: makeAgentCompletions(pi, state),
 		handler: async (args, ctx) => {
 			const { args: cleanedArgs, bg, fork } = extractExecutionFlags(args);
@@ -667,13 +682,13 @@ export function registerSlashCommands(
 				const existingReads = inline.reads.filter((read) => resolveExistingReadPaths([read], state.baseCwd).length > 0);
 				if (existingReads.length > 0) finalTask = `[Read from: ${existingReads.join(", ")}]\n\n${finalTask}`;
 			}
-			const child: Record<string, unknown> = { agent: agentName, task: finalTask, agentScope: "both" };
+			const child: SubagentParamsLike = { agent: agentName, task: finalTask, agentScope: "both" };
 			if (inline.output !== undefined) child.output = inline.output;
 			if (inline.outputMode !== undefined) child.outputMode = inline.outputMode;
 			if (inline.skill !== undefined) child.skill = inline.skill;
 			if (inline.model) child.model = inline.model;
 			if (fork) child.context = "fork";
-			launchCommand(ctx, { workflowScript: slashRunWorkflowScript("run", child), async: bg ? true : false });
+			launchCommand(ctx, options.workflowScriptsDisabled ? { ...child, async: bg } : { workflowScript: slashRunWorkflowScript("run", child), async: bg });
 		},
 	});
 
@@ -695,7 +710,7 @@ export function registerSlashCommands(
 		description: "Host integration bridge: answer an async child inspection request with a correlated widget payload (no model turn)",
 		handler: async (args, ctx) => {
 			if (ctx.mode === "tui") {
-				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", view: \"transcript\" }) interactively.", "info");
+				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", options: { view: \"transcript\" } }) interactively.", "info");
 				return;
 			}
 			if (!ctx.hasUI) return;
@@ -798,7 +813,7 @@ export function registerSlashCommands(
 				ctx.ui.notify(message, "error");
 				return;
 			}
-			if (!ctx.hasUI) {
+			if (ctx.mode !== "tui") {
 				sendSlashText(pi, stopFallbackText(targets));
 				return;
 			}
@@ -808,10 +823,14 @@ export function registerSlashCommands(
 			}
 
 			const result = await ctx.ui.custom<StopSelectorResult>(
-				(tui, theme, _kb, done) => new SubagentsStopSelector(tui, theme, targets, done),
+				(tui, theme, _kb, done) => new SubagentsStopSelector(tui, theme, stopPickerTargets(targets), done),
 				{ overlay: true, overlayOptions: { anchor: "center", width: 88, maxHeight: "80%" } },
 			);
 			if (!result?.confirmed || !result.target) return;
+			if (result.target.kind === "all") {
+				for (const id of result.target.ids) await runCommand(ctx, { action: "stop", id });
+				return;
+			}
 			if (result.target.kind === "scheduled") {
 				await runCommand(ctx, { action: "schedule.pause", id: result.target.id });
 				return;

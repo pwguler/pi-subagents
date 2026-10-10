@@ -46,10 +46,10 @@ function makeState(sessionId: string | null, ctx: unknown): SubagentState {
 	};
 }
 
-function makeCtx(sessionId: string, sessionFile: string | null = null): { cwd: string; hasUI: boolean; sessionManager: { getSessionId: () => string; getSessionFile: () => string | null; getEntries: () => [] } } {
+function makeCtx(sessionId: string, sessionFile: string | null = null): { cwd: string; isIdle: () => boolean; hasUI: boolean; sessionManager: { getSessionId: () => string; getSessionFile: () => string | null; getEntries: () => [] } } {
 	return {
 		cwd: process.cwd(),
-		hasUI: false,
+		isIdle() { return false; }, hasUI: false,
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getSessionFile: () => sessionFile,
@@ -240,10 +240,12 @@ describe("supervisor ask registration", () => {
 				await runtime.emit("session_start");
 				assert.equal(polling.intervals.size, 0);
 				assert.equal(polling.scans.length, 0);
+				const workflowPath = path.join(root, "inspect.js");
+				fs.writeFileSync(workflowPath, "return runs.run('inspect', { agent: 'leaf', task: 'Inspect read-only and report progress.', async: false, output: false });");
 				for (const mode of ["foreground", "workflow"] as const) {
 					const params = mode === "foreground"
 						? { agent: "leaf", task: "Inspect read-only and report progress.", async: false, output: false }
-						: { workflowScript: "return runs.run('inspect', { agent: 'leaf', task: 'Inspect read-only and report progress.', async: false, output: false });", async: false };
+						: { workflow: workflowPath, async: false };
 					const result = await runtime.call("subagent", params);
 					assert.notEqual(result.isError, true, text(result));
 					assert.equal(leaves.at(-1)!.closed, true, "child starts and completes without a timer tick");
@@ -365,8 +367,10 @@ describe("supervisor ask registration", () => {
 							if (launch.runtime.agent === "coordinator") {
 								assert.ok(runtime.registered.has(NATIVE_SUPERVISOR_TOOL_NAME), "B needs a native downward provider");
 								assert.ok(runtime.active().includes(NATIVE_SUPERVISOR_TOOL_NAME), "B's requested supervisor tool must be callable");
+								const workflowPath = path.join(root, "inspect.js");
+								fs.writeFileSync(workflowPath, "return runs.run('inspect', { agent: 'leaf', task: 'Inspect the repository read-only and ask which option to report.', async: false });");
 								const receipt = await runtime.call("subagent", {
-									workflowScript: "return runs.run('inspect', { agent: 'leaf', task: 'Inspect the repository read-only and ask which option to report.', async: false });",
+									workflow: workflowPath,
 									async: true,
 								});
 								assert.notEqual(receipt.isError, true, text(receipt));
@@ -530,7 +534,7 @@ describe("supervisor ask registration", () => {
 			const requestId = writeRequest({ sessionId: runtime.owner, runId });
 			const status = JSON.stringify({ runId, sessionId: runtime.sessionFile, state: "running", mode: "single", pid: process.pid, startedAt: Date.now(), steps: [{ agent: "worker", status: "running" }] });
 			fs.writeFileSync(path.join(root, "status.json"), status);
-			await assert.rejects(runtime.call("subagent", { action: "steer", dir: root, message: "After the decision, inspect docs." }), (error: Error) => {
+			await assert.rejects(runtime.call("subagent", { action: "steer", options: { dir: root }, message: "After the decision, inspect docs." }), (error: Error) => {
 				assert.ok(error.message.includes(`"replyTo":"${requestId}"`), error.message);
 				assert.match(error.message, /not delivered or queued/);
 				return true;
@@ -751,7 +755,7 @@ describe("supervisor ask registration", () => {
 				let stale = false;
 				const ctx = {
 					cwd: root,
-					get hasUI() { if (stale) throw new Error("This extension ctx is stale after session replacement or reload."); return false; },
+					isIdle() { return false; }, get hasUI() { if (stale) throw new Error("This extension ctx is stale after session replacement or reload."); return false; },
 					ui: { setWidget() {}, requestRender() {}, onTerminalInput() { return () => {}; }, notify() {}, theme: { fg(_name, text) { return text; }, bold(text) { return text; } } },
 					sessionManager: {
 						getSessionId() { if (stale) throw new Error("stale session manager"); return owner; },

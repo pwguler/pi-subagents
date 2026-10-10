@@ -68,6 +68,7 @@ import { createWorkflowChildPermit, workflowChildPermitConsumed } from "../../sr
 import { toSubagentDelegationExecutionParams, toSubagentDelegationUpdate } from "../../src/slash/delegation-adapters.ts";
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
+import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installSingleExecutionHooks();
@@ -824,6 +825,128 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(mockPi.callCount(), 2);
 	});
 
+	for (const mode of ["single", "workflow"] as const) {
+		it(`stops a detached ${mode} foreground child when its runtime is replaced and reports it as stopped`, { timeout: 30_000 }, async () => {
+			const agentDir = process.env.PI_CODING_AGENT_DIR!;
+			fs.mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+			fs.writeFileSync(path.join(agentDir, "agents", "asker.md"), "---\nname: asker\ndescription: Asks its supervisor\n---\nIntercom orchestration channel: ask the supervisor before deciding.\n");
+			if (mode === "workflow") {
+				// Workflow children then run in the parent process, like the reported foreground child.
+				fs.mkdirSync(path.join(agentDir, "extensions", "subagent"), { recursive: true });
+				fs.writeFileSync(path.join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify({ asyncByDefault: false }));
+			}
+			const release = path.join(tempDir, "release-child");
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Which path?" })] },
+					{ waitForPath: release, jsonl: [events.assistantMessage("finished after replacement")] },
+				],
+			});
+			type Handler = (event: unknown, ctx: unknown) => unknown;
+			type Tool = { execute(id: string, params: unknown, signal: AbortSignal, onUpdate: ((update: ExecutorToolResult) => void) | undefined, ctx: unknown): Promise<ExecutorToolResult> };
+			const ctx = {
+				...makeMinimalCtx(tempDir),
+				isIdle: () => false,
+				sessionManager: {
+					getSessionId: () => "replaced-runtime-session",
+					getSessionFile: () => path.join(tempDir, "replaced-runtime-session.jsonl"),
+					getEntries: () => [],
+				},
+			};
+			const startRuntime = async (reason: string) => {
+				const bus = createEventBus();
+				const handlers = new Map<string, Handler[]>();
+				let tool: Tool | undefined;
+				const pi = new Proxy({
+					events: bus,
+					on(event: string, handler: Handler) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
+					registerTool(definition: Tool & { name: string }) { if (definition.name === "subagent") tool = definition; },
+					sendMessage() {},
+					getSessionName() { return undefined; },
+				}, { get: (target, prop) => prop in target ? target[prop as keyof typeof target] : () => undefined });
+				const previousChildEnv = process.env[SUBAGENT_CHILD_ENV];
+				delete process.env[SUBAGENT_CHILD_ENV];
+				try {
+					registerSubagentExtension(pi as never);
+				} finally {
+					if (previousChildEnv !== undefined) process.env[SUBAGENT_CHILD_ENV] = previousChildEnv;
+				}
+				for (const handler of handlers.get("session_start") ?? []) await handler({ reason }, ctx);
+				assert.ok(tool, "subagent tool registered");
+				return { bus, tool, shutDown: async (shutdownReason: string) => { for (const handler of handlers.get("session_shutdown") ?? []) await handler({ reason: shutdownReason }, ctx); } };
+			};
+
+			const first = await startRuntime("startup");
+			let detachAccepted = false;
+			first.bus.on(INTERCOM_DETACH_RESPONSE_EVENT, (payload) => { detachAccepted ||= (payload as { accepted?: unknown }).accepted === true; });
+			const detachTimer = setInterval(() => { if (!detachAccepted) first.bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "replace-detach" }); }, 10);
+			let runId: string | undefined;
+			try {
+				if (mode === "single") {
+					const launched = await first.tool.execute("detach-before-replace", { agent: "asker", task: "Ask, then finish", async: false }, new AbortController().signal, undefined, ctx);
+					assert.equal(launched.details.results[0]?.detached, true, launched.content[0]?.text);
+					runId = launched.details.runId;
+				} else {
+					const started = await first.tool.execute("workflow-before-replace", { workflow: "parallel", args: { tasks: [{ agent: "asker", task: "Ask, then finish" }] }, async: true }, new AbortController().signal, undefined, ctx);
+					assert.ok(started.details.asyncDir, started.content[0]?.text);
+					const deadline = Date.now() + 10_000;
+					while ((!detachAccepted || !runId) && Date.now() < deadline) {
+						await new Promise((resolve) => setTimeout(resolve, 20));
+						runId = (JSON.parse(fs.readFileSync(path.join(started.details.asyncDir, "status.json"), "utf-8")) as AsyncStatus).steps?.[0]?.runId;
+					}
+					assert.equal(detachAccepted, true, "the workflow child detached");
+				}
+			} finally {
+				clearInterval(detachTimer);
+			}
+			assert.ok(runId);
+
+			// The child's pending question to its supervisor, as contact_supervisor writes it.
+			const channelDir = resolveSupervisorChannelDir(runId, "asker", 0);
+			ensureSupervisorChannelDir(channelDir);
+			const requestFile = path.join(channelDir, "requests", "replace-question.json");
+			fs.writeFileSync(requestFile, JSON.stringify({
+				type: "subagent.supervisor.request", id: "replace-question", createdAt: Date.now(), expiresAt: Date.now() + 60_000,
+				reason: "need_decision", message: "Which path?", expectsReply: true,
+				orchestratorSessionId: "replaced-runtime-session", runId, agent: "asker", childIndex: 0,
+			}));
+			await first.shutDown("reload");
+			const second = await startRuntime("reload");
+			try {
+				const status = await second.tool.execute("status-after-replace", { action: "status", id: runId }, new AbortController().signal, undefined, ctx);
+				const statusText = status.content[0]?.text ?? "";
+				assert.match(statusText, /asker: Ask, then finish stopped/);
+				assert.match(statusText, /runtime that ran it was replaced/);
+				assert.equal(fs.existsSync(requestFile), false, "the stopped child's pending supervisor request is inactive");
+
+				fs.writeFileSync(release, "release");
+				const child = mockPi.sessions[0];
+				assert.equal(child?.aborted, true, "the detached child was aborted");
+				// The aborted child's own result replaces the record after it settles; it must still say stopped.
+				const settleDeadline = Date.now() + 10_000;
+				while (!child?.settled && Date.now() < settleDeadline) await new Promise((resolve) => setTimeout(resolve, 20));
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				const history = JSON.parse(fs.readFileSync(path.join(DIRS.results, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string; children: Array<{ status: string; error?: string }> }> };
+				const recorded = history.runs.find((run) => run.runId === runId)?.children[0];
+				assert.equal(recorded?.status, "stopped");
+				assert.match(recorded?.error ?? "", /runtime that ran it was replaced/);
+				assert.doesNotMatch(JSON.stringify(child?.session?.messages ?? []), /finished after replacement/);
+
+				mockPi.onCall({ output: "resumed after replacement" });
+				const resumed = await second.tool.execute("resume-after-replace", { action: "resume", id: runId, message: "Continue from where you stopped.", async: true }, new AbortController().signal, undefined, ctx);
+				assert.equal(resumed.isError, undefined, resumed.content[0]?.text);
+				assert.match(resumed.content[0]?.text ?? "", new RegExp(`Revived foreground subagent from ${runId}`));
+				const resultFile = path.join(DIRS.results, `${resumed.details.asyncId}.json`);
+				const deadline = Date.now() + 20_000;
+				while (!fs.existsSync(resultFile) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+				assert.ok(fs.existsSync(resultFile), "the revived run finished");
+			} finally {
+				await second.shutDown("quit");
+				fs.rmSync(channelDir, { recursive: true, force: true });
+			}
+		});
+	}
+
 	it("routes registered structured text delegation through the concurrent executor", async () => {
 		const literalJsonText = '{"looks":"json"}';
 		mockPi.onCall({
@@ -876,6 +999,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		});
 		const ctx = {
 			...makeMinimalCtx(tempDir),
+			isIdle: () => false,
 			modelRegistry: {
 				getAvailable: () => [{ provider: "mock", id: "test-model", reasoning: true }],
 			},
@@ -1360,7 +1484,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 					summary: "done",
 					patch: { path: path.join(repo, ".pi", "subagents", "artifacts", "worktree.patch"), branch: worktree.branch, changed: false, diffStat: "", filesChanged: 0, insertions: 0, deletions: 0 },
 				}],
-				cleanup: { state: "partial", pruned: false, tasks: [{ index: 0, path: worktree.path, branch: worktree.branch, worktreeRemoved: false, branchRemoved: false, preserved: true }] },
+				cleanup: { state: "partial", pruned: false, tasks: [{ index: 0, path: worktree.path, branch: worktree.branch, recordedBaseDir: worktree.recordedBaseDir, worktreeRemoved: false, branchRemoved: false, preserved: true }] },
 			}],
 		}, null, 2), "utf-8");
 		fs.writeFileSync(path.join(repo, ".pi", "subagents", "artifacts", "status.json"), JSON.stringify({ runId: "cleanup-action-run", state: "complete" }), "utf-8");
@@ -1380,9 +1504,16 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 			assert.match(childSafeResult.content[0]?.text ?? "", /child-safe subagent fanout mode/i);
 			const apply = await executor.executePublic("cleanup-apply", { action: "worktree.cleanup", repo: "cleanup-repo", mode: "apply", planId }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			assert.equal(apply.isError, true);
-			assert.match(apply.content[0]?.text ?? "", /plan.*only|apply\/removal is not available/i);
+			assert.match(apply.content[0]?.text ?? "", /requires interactive confirmation/i);
 			assert.ok(fs.existsSync(worktree.path));
 			assert.notEqual(execFileSync("git", ["-C", repo, "branch", "--list", worktree.branch], { encoding: "utf-8" }).trim(), "");
+			const authorized = makeExecutor([makeAgent("echo")], { worktreeBaseDir: baseDir, authorityPolicy: { discardWorktree: "auto" } });
+			const removed = await authorized.executePublic("cleanup-authorized", { action: "worktree.cleanup", repo: "cleanup-repo", mode: "apply", planId }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(removed.isError, undefined, removed.content[0]?.text);
+			assert.match(removed.content[0]?.text ?? "", /complete/);
+			assert.equal(fs.existsSync(worktree.path), false);
+			assert.notEqual(execFileSync("git", ["-C", repo, "branch", "--list", worktree.branch], { encoding: "utf-8" }).trim(), "");
+
 		} finally {
 			try { execFileSync("git", ["-C", repo, "worktree", "remove", "--force", worktree.path], { stdio: "ignore" }); } catch {}
 			try { execFileSync("git", ["-C", repo, "branch", "-D", worktree.branch], { stdio: "ignore" }); } catch {}
@@ -1617,6 +1748,24 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.deepEqual(child?.structuredOutput, { ok: true, note: "captured" });
 		assert.match(child?.finalOutput ?? "", /"ok": true/);
 		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
+	});
+
+	it("saves the structured result, not closing prose, to a bound output file", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const structuredOutput = { ok: true, note: "captured" };
+		mockPi.onCall({ output: "Enough; writing up.", structuredOutput });
+		const outputPath = path.join(tempDir, "structured.json");
+
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"single-schema-output",
+			{ agent: "echo", task: "Return structured data", output: outputPath, outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" }, note: { type: "string" } } }, acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results?.[0]?.savedOutputPath, outputPath);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), JSON.stringify(structuredOutput, null, 2));
 	});
 
 	it("routes retained workflow follow-ups to distinct outputs without overwriting the writer report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -2426,7 +2575,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 
 		assert.equal(result.exitCode, 1);
 		assert.match(result.error ?? "", /^Unknown agent: nonexistent\nEffective cwd: /);
-		assert.match(result.error ?? "", /Consulted agent-definition directories:[\s\S]*Discovered agents:/);
+		assert.match(result.error ?? "", /Consulted agent-definition directories:[\s\S]*Available agents:/);
 		assert.doesNotMatch(result.error ?? "", /echo \(project\)/);
 		assert.equal(result.task, "[prompt redacted]");
 		assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
@@ -2609,6 +2758,28 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		// overwritten by the first message_end event only if result.model is unset.
 		// Since agent has model config, it stays as the configured value.
 		assert.equal(result.model, "anthropic/claude-sonnet-4");
+	});
+
+	it("qualifies a foreground child's reported model with its provider", async () => {
+		mockPi.onCall({
+			jsonl: [{
+				type: "message_end",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "Done" }],
+					provider: "anthropic",
+					model: "claude-haiku-4-5",
+					stopReason: "stop",
+					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+				},
+			}],
+		});
+		// No agent model is configured, so result.model starts unset and is taken
+		// from the first assistant message, which reports the model id alone.
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { acceptance: false });
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.model, "anthropic/claude-haiku-4-5");
 	});
 
 	it("fails when a configured provider-qualified model starts on a different child model", async () => {
@@ -2996,10 +3167,11 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 				events.toolStart("write", { path: "side-effect.txt", content: "done" }),
 				events.toolEnd("write"),
 				events.toolResult("write", "Wrote side-effect.txt"),
-				{ type: "compaction_start" },
-				{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "aborted", usage: { input: 10, output: 0, cacheRead: 2, cacheWrite: 1, cost: { total: 0.01 } } } },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "error", errorMessage: "This operation was aborted", usage: { input: 10, output: 0, cacheRead: 2, cacheWrite: 1, cost: { total: 0.01 } } } },
 				{ type: "agent_settled" },
+				{ type: "compaction_start" },
 			],
+			omitImplicitFinalEvents: true,
 			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
 			keepAliveAfterFinalMessageMs: 5_000,
 			exitCode: 0,
@@ -3625,7 +3797,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(fs.existsSync(path.join(tempDir, "context.md")), false);
 	});
 
-	it("makes task-level output overrides authoritative in the child system prompt", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("delivers the authoritative output override in the task and keeps it out of the child system prompt", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "override report" });
 		const overridePath = path.join(tempDir, "custom-report.md");
 		const executor = makeExecutor([
@@ -3648,10 +3820,24 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
 		assert.equal(result.isError, undefined);
 		assert.match(taskArg, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(overridePath)}`));
+		assert.match(taskArg, /Ignore any other output filename or output path mentioned elsewhere/);
 		assert.match(systemPrompt, /Output format \(`default-report\.md`\):/);
-		assert.match(systemPrompt, /Runtime output path override:/);
-		assert.match(systemPrompt, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(overridePath)}`));
-		assert.match(systemPrompt, /Ignore any other output filename or output path mentioned elsewhere/);
+		assert.doesNotMatch(systemPrompt, new RegExp(escapeRegExp(overridePath)));
+		assert.doesNotMatch(systemPrompt, /Write your findings to exactly this path/);
+
+		// A later stage of the same agent with a new output path keeps the same system prompt, so its prompt cache survives.
+		mockPi.onCall({ output: "second report" });
+		const secondPath = path.join(tempDir, "second-report.md");
+		await executor.execute(
+			"single-output-override-system-prompt-2",
+			{ agent: "researcher", task: "Write report", output: secondPath },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const second = readCall();
+		assert.match(resolveMockPiCallArgs(second).at(-1) ?? "", new RegExp(`Write your findings to exactly this path: ${escapeRegExp(secondPath)}`));
+		assert.equal(second.systemPrompts[0]?.text ?? "", systemPrompt);
 	});
 
 	it("persists read-only file-only output without requiring a child write tool", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -3676,12 +3862,11 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(result.isError, undefined);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "complete read-only analysis");
 		assert.match(result.content[0]?.text ?? "", /Output saved to:/);
-		for (const instruction of [taskArg, systemPrompt]) {
-			assert.match(instruction, /Return the complete artifact in your final response\./);
-			assert.match(instruction, /runtime will persist it to exactly this path:/);
-			assert.match(instruction, /Do not call contact_supervisor merely because no write-capable tool is available\./);
-			assert.doesNotMatch(instruction, /Write your findings to exactly this path/);
-		}
+		assert.match(taskArg, /Return the complete artifact in your final response\./);
+		assert.match(taskArg, /runtime will persist it to exactly this path:/);
+		assert.match(taskArg, /Do not call contact_supervisor merely because no write-capable tool is available\./);
+		assert.doesNotMatch(taskArg, /Write your findings to exactly this path/);
+		assert.doesNotMatch(systemPrompt, /runtime will persist it to exactly this path:/);
 	});
 
 	it("treats string false as disabled output in foreground single runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

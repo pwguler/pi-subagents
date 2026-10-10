@@ -10,6 +10,7 @@ import { executeAsyncSingle } from "../../src/runs/background/async-execution.ts
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { DIRS } from "../../src/shared/types.ts";
 import { makeAgent } from "../support/helpers.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 
 const budgetDirectories: string[] = [];
 
@@ -24,6 +25,33 @@ afterEach(() => {
 });
 
 describe("async recovery descriptor", () => {
+	it("rejects a mandatory-policy launch on an external runner before spawning the runner", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-required-all-"));
+		const runId = `required-all-${Date.now().toString(36)}`;
+		const asyncDir = path.join(DIRS.async, runId);
+		const spawn = t.mock.method(childProcess, "spawn", () => { throw new Error("captured detached spawn"); });
+		syncBuiltinESMExports();
+		const registration = registerRequiredChildExtensions({ sessionId: "required-all-runners", extensions: [{ id: "host-policy", path: import.meta.filename }], requireForAllRunners: true });
+		try {
+			const result = executeAsyncSingle(runId, {
+				agent: "external", task: "Review", agentConfig: makeAgent("external", { runner: { type: "external-cli", command: process.execPath, args: ["fake.mjs"] } }),
+				ctx: { pi: { events: { emit() {} } }, cwd: root, currentSessionId: "required-all-runners" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(root, "sessions"), maxSubagentDepth: 1,
+			});
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /requires child extensions \(host-policy\) for every runner/u);
+			assert.equal(spawn.mock.callCount(), 0);
+			assert.equal(fs.existsSync(asyncDir), false);
+		} finally {
+			registration.dispose();
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+		}
+	});
+
 	it("snapshots an explicit empty descendant allowlist before detached spawn", (t) => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-recovery-allowed-agents-"));
 		const runId = `recovery-allowed-agents-${Date.now().toString(36)}`;
@@ -97,6 +125,24 @@ describe("async recovery descriptor", () => {
 				share: false,
 			}), "utf-8");
 			assert.equal(readAsyncRecoveryDescriptor(root)?.baseRef, "@/foo");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reads a recorded launcher name and rejects an invalid one", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-recovery-launcher-"));
+		const write = (launcher: unknown) => fs.writeFileSync(path.join(root, "recovery-descriptor.json"), JSON.stringify({
+			version: 1, launcher, runFanoutBudget: runFanoutBudget("run-launcher"), sourceRunId: "run-launcher", agent: "worker", cwd: root,
+			systemPromptMode: "replace", inheritGlobalContext: false, inheritProjectContext: false, inheritSkills: false, outputMode: "inline", maxSubagentDepth: 2, share: false,
+		}), "utf-8");
+		try {
+			write("net.v2");
+			assert.equal(readAsyncRecoveryDescriptor(root)?.launcher, "net.v2");
+			for (const launcher of ["'net'", "a b", "", 7]) {
+				write(launcher);
+				assert.throws(() => readAsyncRecoveryDescriptor(root), /launcher must be a launcher name/);
+			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

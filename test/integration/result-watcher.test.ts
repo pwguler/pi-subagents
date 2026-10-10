@@ -770,6 +770,82 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("delivers the final result that replaced a paused result while the paused one was being delivered", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-replaced-"));
+		try {
+			const resultPath = path.join(resultsDir, "replaced-run.json");
+			// The runner's paused result has no tool-call id and its final result adds one; state and timestamp can match.
+			const common = { id: "replaced-run", sessionId: "session-current", completionOwnerId: COMPLETION_OWNER_ID, state: "paused", timestamp: 1_000 };
+			writePendingAsyncResultFile(resultPath, { ...common, runId: "replaced-run", summary: "paused result" });
+			const delivered: string[] = [];
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				notifier: {
+					deliver: async (result) => {
+						delivered.push(String(result.summary));
+						if (delivered.length === 1) writeAsyncResultFile(resultPath, { ...common, toolCallId: "call-a", summary: "final result" });
+						return true;
+					},
+				},
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => delivered.includes("final result") && !fs.existsSync(resultPath)), true, `delivered: ${delivered.join(", ")}`);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+			assert.deepEqual(delivered, ["paused result", "final result"]);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("delivers a final result once when its promotion is denied and the older paused result stays public", async (t) => {
+		for (const finalState of ["paused", "complete"]) {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-stale-public-"));
+			const resultPath = path.join(resultsDir, "stale-public.json");
+			const originalRenameSync = fsDefault.renameSync;
+			const originalError = console.error;
+			try {
+				console.error = () => {};
+				const common = { id: "stale-public", sessionId: "session-current", completionOwnerId: COMPLETION_OWNER_ID, timestamp: 1_000 };
+				writeAsyncResultFile(resultPath, { ...common, runId: "stale-public", state: "paused", summary: "paused result" });
+				t.mock.method(fsDefault, "renameSync", (source: fs.PathLike, target: fs.PathLike) => {
+					if (String(target) === resultPath) throw Object.assign(new Error("denied"), { code: "EPERM" });
+					return originalRenameSync(source, target);
+				});
+				syncBuiltinESMExports();
+				writeAsyncResultFile(resultPath, { ...common, toolCallId: "call-a", state: finalState, summary: "final result" });
+				const delivered: string[] = [];
+				let completions = 0;
+				const state = createState();
+				state.currentSessionId = "session-current";
+				const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) { if (event === SUBAGENT_ASYNC_COMPLETE_EVENT) completions += 1; } } }, state, resultsDir, 60_000, {
+					deliverIntercomResults: false,
+					notifier: { deliver: async (result) => { delivered.push(String(result.summary)); return true; } },
+				});
+				try {
+					watcher.primeExistingResults();
+					assert.equal(await waitForPredicate(() => completions > 0 && !fs.existsSync(resultPath)), true, `${finalState}: delivered ${delivered.length}`);
+					watcher.primeExistingResults();
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				} finally {
+					watcher.stopResultWatcher();
+				}
+				assert.deepEqual(delivered, ["final result"], finalState);
+				assert.equal(completions, 1, finalState);
+				assert.deepEqual(fs.readdirSync(path.join(resultsDir, "result-pending"), { recursive: true }).filter((entry) => String(entry).endsWith(".json")), [], finalState);
+			} finally {
+				console.error = originalError;
+				t.mock.restoreAll();
+				syncBuiltinESMExports();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("delivers indexed pending results during reload when public promotion is blocked", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-pending-index-"));
 		const originalError = console.error;
@@ -1546,7 +1622,7 @@ describe("result watcher", () => {
 			assert.equal(eventData.status, "failed");
 			assert.equal(eventData.parallelHandoff?.path, "/tmp/async-1/handoff.json");
 			const message = String(eventData.message ?? "");
-			assert.match(message, /Revive child: subagent\(\{ action: "resume", id: "async-1", index: 0, message: "\.\.\." \}\)/);
+			assert.match(message, /Revive child: subagent\(\{ action: "resume", id: "async-1", message: "\.\.\.", options: \{ index: 0 \} \}\)/);
 			assert.ok(message.includes(`Session: ${firstSession}`));
 			assert.match(message, /Parallel handoff: \/tmp\/async-1\/handoff\.json/);
 			assert.match(message, /Outputs: 2 present \(semantic adequacy unassessed\)/);

@@ -3,6 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import type { AssistantMessage, Message, Model, ToolResultMessage } from "@earendil-works/pi-ai";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { normalizeContext } from "@earendil-works/pi-ai/utils/transcript";
 import { createEventBus } from "../support/helpers.ts";
 import { RUNTIME_EXTENSION_ACK_EVENT } from "../../src/runs/shared/runtime-acknowledged-extensions.ts";
 import { clearStructuredOutputCaptures } from "../../src/runs/shared/structured-output.ts";
@@ -20,6 +23,7 @@ import registerSubagentPromptRuntime, {
 	CHILD_FANOUT_BOUNDARY_INSTRUCTIONS,
 	CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS,
 	registerPermissionGate,
+	registerSubagentPromptBoundary,
 	rewriteSubagentPrompt,
 	stripGlobalContext,
 	stripInheritedSkills,
@@ -411,12 +415,14 @@ describe("subagent prompt runtime", () => {
 			const terminalState = { captured: false };
 			let execute: ((_id: string, params: { value: unknown }) => Promise<{ terminate?: boolean }>) | undefined;
 			let parameters: unknown;
+			let exposure: unknown;
 
 			registerSubagentPromptRuntime({
-				registerTool(tool: { name: string; parameters: unknown; execute: (_id: string, params: { value: unknown }) => Promise<{ terminate?: boolean }> }) {
+				registerTool(tool: { name: string; parameters: unknown; exposure?: string; execute: (_id: string, params: { value: unknown }) => Promise<{ terminate?: boolean }> }) {
 					if (tool.name === "structured_output") {
 						execute = tool.execute;
 						parameters = tool.parameters;
+						exposure = tool.exposure;
 					}
 				},
 				on() {},
@@ -425,6 +431,7 @@ describe("subagent prompt runtime", () => {
 			}));
 
 			assert.ok(execute, "structured_output tool should be registered");
+			assert.equal(exposure, "model-only", "a nested structured_output call cannot terminate the step");
 			assert.deepEqual(parameters, {
 				type: "object",
 				properties: { value: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } } },
@@ -682,13 +689,23 @@ describe("subagent prompt runtime", () => {
 			inheritSkills: true,
 		});
 
-		assert.ok(rewritten.startsWith(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
+		assert.ok(rewritten.endsWith(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
 		assert.ok(rewritten.includes("Do not propose or run subagents."));
 		assert.ok(rewritten.includes("If you need to edit files, use the available editing tools."));
 		assert.ok(!rewritten.includes("call the actual edit/write tools"));
 		assert.ok(rewritten.includes("Do not print tool-call syntax, patches, or pseudo-tool calls as text."));
-		assert.equal(rewriteSubagentPrompt(rewritten, { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }).indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 0);
-		assert.equal(rewriteSubagentPrompt(rewritten, { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }).lastIndexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 0);
+		assert.equal(rewriteSubagentPrompt(rewritten, { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }), rewritten);
+	});
+
+	it("keeps Pi's base prompt first and appends the boundary and structured-output instructions once", () => {
+		const piPrompt = "You are an expert coding assistant operating inside pi, a coding agent harness.\n\nAvailable tools:\n- read\n\nCurrent working directory: /repo";
+		const options = { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true, structuredOutput: true };
+		const rewritten = rewriteSubagentPrompt(piPrompt, options);
+
+		assert.ok(rewritten.startsWith("You are an expert coding assistant operating inside pi"));
+		assert.ok(rewritten.indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS) > rewritten.indexOf("Current working directory: /repo"));
+		assert.ok(rewritten.endsWith("if you do not call `structured_output`, the parent will fail this step."));
+		assert.equal(rewriteSubagentPrompt(rewritten, options), rewritten);
 	});
 
 	it("replaces inherited child boundaries with the fanout boundary when authorized", () => {
@@ -700,12 +717,13 @@ describe("subagent prompt runtime", () => {
 			fanoutChild: true,
 		});
 
-		assert.ok(rewritten.startsWith(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS));
+		assert.ok(rewritten.startsWith("You are a subagent."));
+		assert.ok(rewritten.endsWith(`\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`));
 		assert.ok(rewritten.includes("You may use the `subagent` tool only for the fanout work explicitly requested in this task."));
 		assert.ok(rewritten.includes("If you need to edit files, use the available editing tools."));
 		assert.ok(!rewritten.includes("call the actual edit/write tools"));
 		assert.ok(!rewritten.includes("Do not propose or run subagents."));
-		assert.equal(rewritten.lastIndexOf(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS), 0);
+		assert.equal(rewritten.indexOf(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS), rewritten.lastIndexOf(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS));
 	});
 
 	it("replaces inherited fanout boundaries with the strict boundary when fanout is not authorized", () => {
@@ -716,9 +734,10 @@ describe("subagent prompt runtime", () => {
 			inheritSkills: true,
 		});
 
-		assert.ok(rewritten.startsWith(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
+		assert.ok(rewritten.startsWith("You are a subagent."));
+		assert.ok(rewritten.endsWith(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
 		assert.ok(!rewritten.includes("explicit fanout responsibility"));
-		assert.equal(rewritten.lastIndexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 0);
+		assert.equal(rewritten.indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), rewritten.lastIndexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
 	});
 
 	it("keeps explicitly injected skill content when inherited skills are stripped", () => {
@@ -1067,36 +1086,39 @@ describe("subagent prompt runtime", () => {
 		});
 	}
 
-	it("rewrites the final child-visible prompt through before_agent_start", async () => {
-		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
+	it("filters parent-only context out of the prompt inputs in place without replacing the prompt", async () => {
+		let beforeAgentStart: ((event: unknown) => Promise<unknown>) | undefined;
 		registerSubagentPromptRuntime({
-			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
+			on(event: string, handler: (payload: unknown) => Promise<unknown>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
-			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> }, childConfig({ inheritProjectContext: false, inheritGlobalContext: true, inheritSkills: false }));
+			getAllTools: () => [],
+		} as never, childConfig({ inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: true }));
+		const options = {
+			customPrompt: `Role.\n\n<skill name="pi-subagents">\nOrchestrate.\n</skill>\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`,
+			appendSystemPrompt: `Extra.\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`,
+			contextFiles: [{ path: path.join(getAgentDir(), "AGENTS.md"), content: "Global" }, { path: "/repo/AGENTS.md", content: "Repo" }],
+			skills: [{ name: "pi-subagents" }, { name: "safe-bash" }],
+			sections: {},
+		};
 
-		assert.ok(beforeAgentStart, "expected before_agent_start handler");
-
-		const rewritten = await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
-		assert.ok(rewritten);
-		assert.ok(!rewritten.systemPrompt.includes("# Project Context"));
-		assert.ok(!rewritten.systemPrompt.includes("<available_skills>"));
-		assert.ok(rewritten.systemPrompt.includes("Current date: 2026-04-16"));
+		assert.equal(await beforeAgentStart?.({ systemPrompt: "rendered", systemPromptOptions: options }), undefined);
+		assert.deepEqual(options.contextFiles.map((file) => file.content), ["Repo"]);
+		assert.deepEqual(options.skills.map((skill) => skill.name), ["safe-bash"]);
+		assert.equal(options.customPrompt, "Role.");
+		assert.equal(options.appendSystemPrompt, "Extra.");
 	});
 
-	it("uses the fanout boundary through before_agent_start for a fanout child", async () => {
-		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
-		registerSubagentPromptRuntime({
-			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
-				if (event === "before_agent_start") beforeAgentStart = handler;
-			},
-			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> }, childConfig({ fanoutChild: true, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }));
+	it("appends the child boundary once to the complete prompt, after another extension's own prompt", () => {
+		const handlers: Array<(event: { systemPrompt: string }) => { systemPrompt: string } | undefined> = [];
+		const api = { on: (_event: string, handler: (typeof handlers)[number]) => handlers.push(handler) } as never;
+		registerSubagentPromptBoundary(api, childConfig({ fanoutChild: true, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }));
+		registerSubagentPromptBoundary(api, childConfig());
 
-		const rewritten = await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
-		assert.ok(rewritten);
-		assert.ok(rewritten.systemPrompt.startsWith(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS));
+		assert.equal(handlers.length, 1, "inert without inheritance settings or fanout");
+		const finalized = handlers[0]!({ systemPrompt: `Own prompt.\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}` });
+		assert.equal(finalized?.systemPrompt, `Own prompt.\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`);
+		assert.equal(handlers[0]!({ systemPrompt: finalized!.systemPrompt }), undefined);
 	});
 
 	it("filters parent-only artifacts from polluted fork context while preserving ordinary history", () => {
@@ -1122,29 +1144,89 @@ describe("subagent prompt runtime", () => {
 		});
 	});
 
-	it("bounds composite tool ids for Codex child context", () => {
-		let contextHandler: ((event: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) | undefined;
+	describe("Codex child context tool ids on the Responses wire", () => {
+		const model: Model<"openai-codex-responses"> = {
+			id: "codex-test", name: "Codex test", api: "openai-codex-responses", provider: "openai-codex",
+			baseUrl: "https://example.invalid", reasoning: true, input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 4096,
+		};
+		let contextHandler: ((event: { messages: unknown[] }, ctx: { model: typeof model }) => { messages: unknown[] } | undefined) | undefined;
 		registerSubagentPromptRuntime({
-			on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined) {
+			on(event: string, handler: typeof contextHandler) {
 				if (event === "context") contextHandler = handler;
 			},
-		} as { on(event: string, handler: (payload: { messages: unknown[] }, ctx: { model?: { api: string } }) => { messages: unknown[] } | undefined): void }, childConfig());
+		} as never, childConfig());
 
-		const toolCallId = "call_N7iYNRPXLl9czpXh3bDyMpIL|fc_0e76718634eca88f016a76fdc89aec81919763fa7858f67a0d";
-		const messages = [
-			{ role: "user", content: "Task" },
-			{ role: "assistant", content: [{ type: "toolCall", id: toolCallId, name: "read", input: { path: "README.md" } }] },
-			{ role: "toolResult", toolName: "read", toolCallId, content: "file" },
-		];
+		function history(toolCallId: string): Message[] {
+			return [
+				{ role: "user", content: "Task", timestamp: 1 },
+				{
+					role: "assistant", api: model.api, provider: model.provider, model: model.id,
+					content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "README.md" } }],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					stopReason: "toolUse", timestamp: 2,
+				},
+				{ role: "toolResult", toolName: "read", toolCallId, content: [{ type: "text", text: "file" }], isError: false, timestamp: 3 },
+			];
+		}
 
-		const context = contextHandler?.({ messages }, { model: { api: "openai-codex-responses" } });
-		assert.ok(context);
-		const mappedCallId = (context.messages[1] as { content: Array<{ id?: unknown }> }).content[0]?.id;
-		const mappedResultId = (context.messages[2] as { toolCallId?: unknown }).toolCallId;
-		assert.equal(typeof mappedCallId, "string");
-		assert.match(mappedCallId, /^[a-zA-Z0-9_-]+$/);
-		assert.ok(mappedCallId.length <= 64);
-		assert.equal(mappedResultId, mappedCallId);
+		function assertWire(messages: Message[], callId: string, itemId: string | undefined): void {
+			const wire = convertResponsesMessages(model, normalizeContext({ messages }), new Set(["openai", "openai-codex", "opencode"]));
+			assert.deepEqual(wire.filter((item) => item.type === "function_call" || item.type === "function_call_output"), [
+				{ type: "function_call", id: itemId, call_id: callId, name: "read", arguments: '{"path":"README.md"}' },
+				{ type: "function_call_output", call_id: callId, output: "file" },
+			]);
+		}
+
+		for (const [label, toolCallId] of [
+			["original #903 fixture", "call_N7iYNRPXLl9czpXh3bDyMpIL|fc_0e76718634eca88f016a76fdc89aec81919763fa7858f67a0d"],
+			["exactly 64 characters per half", `${"a".repeat(64)}|fc_${"b".repeat(61)}`],
+			["portable mixed charset", "call_AZaz09_-|fc_AZaz09_-"],
+			["non-fc_ item (serializer omits item id)", "call_read|ctc_item"],
+			["ordinary portable single id", "call_read-OK_09"],
+		] as const) {
+			it(`preserves ${label}`, () => {
+				const messages = history(toolCallId);
+				assert.ok(contextHandler);
+				assert.equal(contextHandler({ messages }, { model }), undefined, "preservation must not rewrite context");
+				const [callId, itemId] = toolCallId.split("|");
+				assertWire(messages, callId!, itemId?.startsWith("fc_") ? itemId : undefined);
+			});
+		}
+
+		for (const [label, toolCallId] of [
+			["65-character call half", `${"a".repeat(65)}|fc_item`],
+			["65-character item half", `call_read|fc_${"b".repeat(62)}`],
+			["both halves oversized", `${"a".repeat(65)}|fc_${"b".repeat(62)}`],
+			["empty call half", "|fc_item"],
+			["empty item half", "call_read|"],
+			["both halves empty", "|"],
+			["extra separator", "call_read|fc_item|extra"],
+			["invalid call charset", "call.read|fc_item"],
+			["invalid item charset", "call_read|fc_item/bad"],
+			["whitespace", "call_read|fc_item\n"],
+			["non-ASCII", "call_read|fc_é"],
+			["empty single id", ""],
+			["oversized single id", "a".repeat(65)],
+		] as const) {
+			it(`uses the deterministic bounded fallback for ${label}`, () => {
+				const messages = history(toolCallId);
+				assert.ok(contextHandler);
+				const context = contextHandler({ messages }, { model });
+				assert.ok(context);
+				assert.deepEqual(context.messages, stripParentOnlySubagentMessages(messages), "fallback must match the existing default sanitizer");
+				assert.deepEqual(contextHandler({ messages }, { model }), context, "mapping must be deterministic");
+				const assistant = context.messages[1] as AssistantMessage;
+				const call = assistant.content[0];
+				assert.equal(call?.type, "toolCall");
+				if (call?.type !== "toolCall") assert.fail("expected tool call");
+				assert.notEqual(call.id, toolCallId);
+				assert.match(call.id, /^[A-Za-z0-9_-]+$/);
+				assert.ok(call.id.length <= 64);
+				assert.equal((context.messages[2] as ToolResultMessage).toolCallId, call.id);
+				assertWire(context.messages as Message[], call.id, undefined);
+			});
+		}
 	});
 
 	it("preserves composite tool ids for non-Codex APIs that normalize them", () => {

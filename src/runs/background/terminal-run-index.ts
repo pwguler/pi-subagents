@@ -4,11 +4,14 @@ import type { AsyncStatus } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { encodeIndexSegment } from "./index-segment.ts";
+import { isSafeNestedPathId } from "../shared/nested-path.ts";
 
 export const TERMINAL_RUN_INDEX_DIR = ".terminal-runs";
 
 const TERMINAL_RUN_INDEX_VERSION = 1;
 const TIMESTAMP_WIDTH = 16;
+// Literal @ cannot occur in an encoded session key.
+const TOOL_CALL_INDEX_DIR = "@tool-calls";
 
 interface TerminalRunIndexEntry {
 	version: 1;
@@ -27,6 +30,14 @@ function indexRoot(asyncDirRoot: string): string {
 
 function sessionIndexDir(asyncDirRoot: string, sessionId: string): string {
 	return path.join(indexRoot(asyncDirRoot), encodeIndexSegment(sessionId));
+}
+
+function toolCallIndexDir(asyncDirRoot: string, toolCallId: string): string {
+	return path.join(indexRoot(asyncDirRoot), TOOL_CALL_INDEX_DIR, encodeIndexSegment(toolCallId));
+}
+
+function toolCallMarkerName(runId: string): string {
+	return `${encodeIndexSegment(runId, 250)}.json`;
 }
 
 function markerName(endedAt: number, runId: string): string {
@@ -58,6 +69,14 @@ export function updateTerminalRunIndex(asyncDir: string, status: AsyncStatus): v
 		endedAt,
 	};
 	writeAtomicJson(marker, entry);
+	if (status.toolCallId) {
+		try {
+			writeAtomicJson(path.join(toolCallIndexDir(path.dirname(asyncDir), status.toolCallId), toolCallMarkerName(entry.runId)), entry);
+		} catch (error) {
+			// Optional aliases must not block authoritative terminal indexing or capacity release.
+			console.error(`Failed to write async terminal-run tool-call index for '${asyncDir}':`, error);
+		}
+	}
 }
 
 function removeInvalidMarker(marker: string): void {
@@ -89,7 +108,7 @@ function sessionDirs(asyncDirRoot: string, sessionId: string | undefined): strin
 	if (sessionId) return [sessionIndexDir(asyncDirRoot, sessionId)];
 	try {
 		return fs.readdirSync(indexRoot(asyncDirRoot), { withFileTypes: true })
-			.filter((entry) => entry.isDirectory())
+			.filter((entry) => entry.isDirectory() && entry.name !== TOOL_CALL_INDEX_DIR)
 			.map((entry) => path.join(indexRoot(asyncDirRoot), entry.name));
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
@@ -103,6 +122,32 @@ function recentMarkerFiles(dirs: string[], limit: number): string[] {
 		.sort((left, right) => right.name.localeCompare(left.name))
 		.slice(0, limit)
 		.map((marker) => path.join(marker.dir, marker.name));
+}
+
+export function readTerminalRunToolCallIndex(asyncDirRoot: string, toolCallId: string): string[] {
+	const runIds: string[] = [];
+	for (const file of markerFiles(toolCallIndexDir(asyncDirRoot, toolCallId))) {
+		const marker = path.join(file.dir, file.name);
+		let entry: TerminalRunIndexEntry | undefined;
+		try {
+			entry = parseEntry(JSON.parse(fs.readFileSync(marker, "utf-8")));
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			if (!(error instanceof SyntaxError)) throw error;
+		}
+		if (!entry || !isSafeNestedPathId(entry.runId) || file.name !== toolCallMarkerName(entry.runId)) {
+			removeInvalidMarker(marker);
+			continue;
+		}
+		const status = readStatus(path.join(asyncDirRoot, entry.runId));
+		if (!status || !isTerminalState(status.state) || status.runId !== entry.runId
+			|| status.sessionId !== entry.sessionId || status.toolCallId !== toolCallId) {
+			removeInvalidMarker(marker);
+			continue;
+		}
+		runIds.push(entry.runId);
+	}
+	return runIds;
 }
 
 export function readRecentTerminalRunIndex(asyncDirRoot: string, options: { sessionId?: string; limit?: number } = {}): string[] {

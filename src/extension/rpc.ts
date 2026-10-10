@@ -3,7 +3,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
 import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
-import { deliverStopRequest } from "../runs/background/control-channel.ts";
+import { deliverAsyncRunStop } from "../runs/foreground/async-stop-action.ts";
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
@@ -21,7 +21,8 @@ import {
 } from "../shared/types.ts";
 import { sanitizeDisplayText, truncateDisplayText } from "../shared/display-text.ts";
 import { readStatus } from "../shared/utils.ts";
-import { SubagentParams } from "./schemas.ts";
+import { SubagentFlatParams } from "./schemas.ts";
+import { disabledFeatureUseError, type DisabledFeatureSurface } from "../shared/disabled-features.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
 import { collectSubagentCost, SUBAGENT_COST_REPORT_VERSION } from "../slash/subagent-cost.ts";
 import { ASYNC_STATUS_SNAPSHOT_KIND, ASYNC_STATUS_SNAPSHOT_VERSION, buildAsyncStatusSnapshotForState } from "../runs/background/async-status-snapshot.ts";
@@ -318,6 +319,11 @@ interface RegisterSubagentRpcBridgeOptions {
 	now?: () => number;
 	/** Native live state, projected into the optional public fleet-status capability. */
 	state?: SubagentState;
+	disabledFeatures?: DisabledFeatureSurface;
+}
+
+function enabledManagementActions(options: RegisterSubagentRpcBridgeOptions): string[] {
+	return SUBAGENT_RPC_MANAGEMENT_ACTIONS.filter((action) => !options.disabledFeatures?.actions.has(action));
 }
 
 class SubagentRpcError extends Error {
@@ -330,7 +336,7 @@ class SubagentRpcError extends Error {
 	}
 }
 
-const subagentParamsValidator = Compile(SubagentParams);
+const subagentParamsValidator = Compile(SubagentFlatParams);
 
 export function subagentRpcReplyEvent(requestId: string): string {
 	return `${SUBAGENT_RPC_REPLY_EVENT_PREFIX}${requestId}`;
@@ -438,14 +444,14 @@ function sessionData(ctx: ExtensionContext | null): { cwd?: string; sessionId?: 
 	};
 }
 
-function pingData(ctx: ExtensionContext | null) {
+function pingData(ctx: ExtensionContext | null, options: RegisterSubagentRpcBridgeOptions) {
 	return {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		methods: [...SUBAGENT_RPC_METHODS],
 		capabilities: {
 			status: true,
 			statusProjection: { version: 1, untargeted: "in-memory-when-ready", targeted: "executor" },
-			managementActions: [...SUBAGENT_RPC_MANAGEMENT_ACTIONS],
+			managementActions: enabledManagementActions(options),
 			fleetStatus: { version: 1 },
 			asyncStatusSnapshot: { kind: ASYNC_STATUS_SNAPSHOT_KIND, version: ASYNC_STATUS_SNAPSHOT_VERSION },
 			asyncSpawn: true,
@@ -485,12 +491,13 @@ async function executeChecked(
 	return dataFromToolResult(result);
 }
 
-function manageParams(params: unknown): SubagentParamsLike {
+function manageParams(params: unknown, options: RegisterSubagentRpcBridgeOptions): SubagentParamsLike {
 	const input = assertRecordParams(params, "manage");
 	if (typeof input.action !== "string" || !(SUBAGENT_RPC_MANAGEMENT_ACTIONS as readonly string[]).includes(input.action)) {
+		const enabled = enabledManagementActions(options);
 		throw new SubagentRpcError(
 			"invalid_params",
-			`RPC manage action must be one of: ${SUBAGENT_RPC_MANAGEMENT_ACTIONS.join(", ")}.`,
+			enabled.length > 0 ? `RPC manage action must be one of: ${enabled.join(", ")}.` : "RPC manage actions are all disabled by config.",
 		);
 	}
 	if (input.id !== undefined && (typeof input.id !== "string" || !input.id.trim())) {
@@ -513,8 +520,20 @@ function manageParams(params: unknown): SubagentParamsLike {
 	return output;
 }
 
-function spawnParams(params: unknown): SubagentParamsLike {
-	const input = assertRecordParams(params, "spawn");
+function spawnParams(params: unknown, options: RegisterSubagentRpcBridgeOptions): SubagentParamsLike {
+	const { script, ...input } = assertRecordParams(params, "spawn");
+	if (Object.hasOwn(input, "workflowScript")) throw new SubagentRpcError("invalid_params", "RPC spawn workflowScript was removed; pass inline script text as script.");
+	if (Object.hasOwn(input, "workflowScriptPath")) throw new SubagentRpcError("invalid_params", "RPC spawn workflowScriptPath was removed; pass the file as workflow: \"./path/to/script.js\".");
+	if (input.workflow === true || input.workflow === "true") throw new SubagentRpcError("invalid_params", "RPC spawn has no reply block for workflow: true; pass inline script text as script or a file as workflow: \"./path/to/script.js\".");
+	if (script !== undefined) {
+		if (typeof script !== "string" || !script.trim()) throw new SubagentRpcError("invalid_params", "RPC spawn script must be a non-empty string.");
+		if (input.workflow !== undefined) throw new SubagentRpcError("invalid_params", "RPC spawn script cannot be combined with workflow.");
+		// The executor's internal carrier; the model-facing tool cannot set it.
+		input.workflowScript = script;
+	}
+	// With workflow scripts disabled, name the setting before normalization can report a script-shape error instead.
+	const disabledFeatureError = options.disabledFeatures?.features.has("workflow-scripts") ? disabledFeatureUseError(input, options.disabledFeatures, "RPC spawn") : undefined;
+	if (disabledFeatureError) throw new SubagentRpcError("invalid_params", disabledFeatureError);
 	const normalized = normalizePublicSubagentExecution(input);
 	if (!normalized.ok) throw new SubagentRpcError("invalid_params", normalized.error);
 	if (normalized.params.action !== undefined) {
@@ -666,8 +685,9 @@ function stopAsyncRun(
 	if (status.sessionId !== currentSessionId) {
 		throw new SubagentRpcError("not_found", `Async run '${runId}' was not found in the active session.`);
 	}
-	if (status.state !== "running") {
-		throw new SubagentRpcError("invalid_state", `Async run ${runId} is ${status.state}; stop only supports running async runs.`);
+	const pausedWholeRun = status.state === "paused" && childId === undefined;
+	if (status.state !== "running" && status.state !== "queued" && !pausedWholeRun) {
+		throw new SubagentRpcError("invalid_state", `Async run ${runId} is ${status.state}; stop only supports running or queued async runs, or a paused whole run.`);
 	}
 	if (childId !== undefined) {
 		const resolution = resolveAsyncStatusChild(status, childId);
@@ -679,19 +699,23 @@ function stopAsyncRun(
 	}
 
 	try {
-		deliverStopRequest({
+		const failure = deliverAsyncRunStop({
 			asyncDir: location.asyncDir,
+			status,
+			resultsDir,
 			pid: status.pid,
 			kill: options.kill,
 			now: options.now,
 			source: "rpc-stop",
 			...(child ? { targetIndex: child.index, childId: child.id } : {}),
 		});
+		if (failure) throw new Error(`Stop request persisted for paused async run ${runId}, but terminal proof is not ready (${failure}). Retry stop after runner shutdown is observed.`);
 	} catch (error) {
 		throw new SubagentRpcError("execution_failed", error instanceof Error ? error.message : String(error));
 	}
 	if (child) emitChildStopping(runId, location.asyncDir, child);
 
+	// This is an acceptance receipt, not terminal proof, even when a proven paused run was sealed.
 	return {
 		runId,
 		asyncDir: location.asyncDir,
@@ -708,14 +732,14 @@ async function handleRequest(
 	fleetKeys: FleetKeyState,
 ): Promise<unknown> {
 	const ctx = options.getContext();
-	if (request.method === "ping") return pingData(ctx);
+	if (request.method === "ping") return pingData(ctx, options);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
 
 	if (request.method === "manage") {
-		return executeChecked(options, ctx, request.requestId, request.method, manageParams(request.params));
+		return executeChecked(options, ctx, request.requestId, request.method, manageParams(request.params, options));
 	}
 	if (request.method === "spawn") {
-		return executeChecked(options, ctx, request.requestId, request.method, spawnParams(request.params));
+		return executeChecked(options, ctx, request.requestId, request.method, spawnParams(request.params, options));
 	}
 	if (request.method === "status") {
 		const statusParams = normalizeStatusParams(request.params);
@@ -848,7 +872,7 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 
 	return {
 		emitReady: (ctx) => {
-			options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext()));
+			options.events.emit(SUBAGENT_RPC_READY_EVENT, pingData(ctx ?? options.getContext(), options));
 		},
 		dispose: () => {
 			if (typeof unsubscribe === "function") unsubscribe();

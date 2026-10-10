@@ -89,6 +89,63 @@ describe("public launch contract preflight", () => {
 		} finally { registration.dispose(); }
 	});
 
+	it("validates a Claude Code model and level the way the launch does", async () => {
+		const cwd = path.join(tempDir, "cc-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "cc.md"), `---\nname: cc\ndescription: Claude Code agent\nrunner:\n  type: external-cli\n  adapter: claude-code\n  command: claude\n---\nReview.\n`);
+
+		const overCeiling = await resolveSubagentLaunchContract({ agent: "cc", cwd, model: "sonnet:max", thinkingCeiling: "low" });
+		assert.equal(overCeiling.ok, false);
+		if (overCeiling.ok) return;
+		assert.equal(overCeiling.code, "thinking_ceiling");
+		assert.match(overCeiling.message, /exceeds configured maximum 'low'/u);
+
+		const invalidModel = await resolveSubagentLaunchContract({ agent: "cc", cwd, model: ":turbo" });
+		assert.equal(invalidModel.ok, false);
+		if (invalidModel.ok) return;
+		assert.equal(invalidModel.code, "unsupported_mode");
+		assert.match(invalidModel.message, /Invalid Claude Code model/u);
+
+		const agentDir = process.env.PI_CODING_AGENT_DIR;
+		assert.equal(typeof agentDir, "string");
+		writeJson(path.join(agentDir!, "settings.json"), { subagents: { modelScope: { enforce: true, allow: ["anthropic/claude-opus-4-5"] } } });
+
+		// An enforced scope fails closed, for a model outside it and for a launch with none.
+		const outsideScope = await resolveSubagentLaunchContract({ agent: "cc", cwd, model: "opus" });
+		assert.equal(outsideScope.ok, false);
+		if (outsideScope.ok) return;
+		assert.equal(outsideScope.code, "model_scope");
+		assert.match(outsideScope.message, /outside the configured subagent model scope/u);
+
+		const unnamed = await resolveSubagentLaunchContract({ agent: "cc", cwd });
+		assert.equal(unnamed.ok, false);
+		if (unnamed.ok) return;
+		assert.equal(unnamed.code, "model_scope");
+		assert.match(unnamed.message, /cannot be checked against an enforced subagent model scope/u);
+	});
+
+	it("resolves models from user settings when the session declined project trust", async () => {
+		const cwd = path.join(tempDir, "untrusted-repo");
+		const agentDir = process.env.PI_CODING_AGENT_DIR!;
+		writeAgent(path.join(agentDir, "agents", "probe.md"), "---\nname: probe\ndescription: Probe\n---\nUser body.\n");
+		writeJson(path.join(agentDir, "settings.json"), { subagents: { agentOverrides: { probe: { model: "openai/luna" } }, modelScope: { enforce: true, allow: ["openai/luna"] } } });
+		writeJson(path.join(cwd, ".pi", "settings.json"), { subagents: { agentOverrides: { probe: { model: "openai/astra" } }, modelScope: { enforce: true, allow: ["openai/astra"] } } });
+		const availableModels = [{ provider: "openai", id: "luna" }, { provider: "openai", id: "astra" }];
+
+		const untrusted = await resolveSubagentLaunchContract({ agent: "probe", cwd, availableModels, projectTrusted: false });
+		assert.equal(untrusted.ok && untrusted.contract.model, "openai/luna");
+		await assert.rejects(resolveSubagentLaunchContract({ agent: "probe", cwd, availableModels, projectTrusted: false, model: "openai/astra" }), /outside the configured subagent model scope/u);
+		const projectScope = await resolveSubagentLaunchContract({ agent: "probe", cwd, availableModels, projectTrusted: false, agentScope: "project" });
+		assert.equal(projectScope.ok, false);
+		if (projectScope.ok) return;
+		assert.equal(projectScope.code, "restricted_agent");
+		assert.match(projectScope.message, /agentScope: "project" requires project trust/u);
+
+		// Omitted trust keeps the project's settings, as before.
+		const trusted = await resolveSubagentLaunchContract({ agent: "probe", cwd, availableModels });
+		assert.equal(trusted.ok && trusted.contract.model, "openai/astra");
+	});
+
 	it("resolves an ordinary single-agent contract without creating launch directories", async () => {
 		const cwd = path.join(tempDir, "repo");
 		fs.mkdirSync(cwd, { recursive: true });
@@ -569,7 +626,7 @@ Project prompt.
 		assert.match(missingAgent.message, /^Unknown agent: missing\nEffective cwd: /);
 		assert.match(missingAgent.message, /Consulted agent-definition directories:/);
 		assert.match(missingAgent.message, /project: .*\.pi[\\/]agents \(1 candidate\)/);
-		assert.match(missingAgent.message, /Discovered agents:\n[\s\S]*worker \(project\)/);
+		assert.match(missingAgent.message, /Available agents:\n[\s\S]*worker \(project\)/);
 		writeAgent(path.join(cwd, ".pi", "agents", "broken.md"), `---
 name: broken
 description: Broken worker
@@ -769,6 +826,18 @@ Project prompt.
 		assert.ok(result.contract.tools.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fanout-child.ts")));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/config-ext.ts"));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/subagent-only.ts"));
+	});
+
+	it("resolves mcp: selectors against the built-in MCP of the given host", async () => {
+		const cwd = path.join(tempDir, "builtin-mcp-repo");
+		writeAgent(path.join(cwd, ".pi", "agents", "docs.md"), "---\nname: docs\ndescription: Docs\ntools:\n  - read\n  - mcp:docs/search\n---\n");
+		const result = await resolveSubagentLaunchContract({ agent: "docs", cwd, runtimeSnapshotHost: {
+			events: { emit() {} },
+			getCommands: () => [{ name: "mcp", sourceInfo: { path: "builtin:mcp" } }],
+			getAllTools: () => [{ name: "mcp__docs__search", exposure: "codemode", namespace: { name: "mcp__docs" } }],
+		} });
+		assert.equal(result.ok, true);
+		assert.deepEqual(result.contract.tools.effectiveMcpTools, ["mcp__docs__search"]);
 	});
 
 	it("inherits agent structured output and honors false for native and external runners", async () => {

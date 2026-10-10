@@ -5,16 +5,18 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import registerSubagentExtension from "../../src/extension/index.ts";
-import { supportsMinimumVersion, unsupportedDynamicToolsReason } from "../../src/extension/tool-activation.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
-import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
+import { resolvePiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
 
 type Handler = (event: any, context: any) => any;
 type Tool = { name: string; description?: string; promptSnippet?: string; parameters?: unknown; execute?: (...args: any[]) => any };
 
 const runtimes: Array<{ handlers: Map<string, Handler[]>; context: any }> = [];
 
-function createRuntime(messages: any[] = [], excluded: string[] = [], missingApis: string[] = [], declareHost = true) {
+type RuntimeOptions = { config?: Record<string, unknown>; model?: unknown };
+const DYNAMIC: RuntimeOptions = { config: { toolActivation: "dynamic" } };
+
+function createRuntime(messages: any[] = [], excluded: string[] = [], missingApis: string[] = [], options: RuntimeOptions = {}) {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, Tool>();
 	let activeNames = ["read"];
@@ -45,7 +47,7 @@ function createRuntime(messages: any[] = [], excluded: string[] = [], missingApi
 		return property in target ? target[property as keyof typeof target] : () => undefined;
 	} });
 	const context = {
-		cwd: process.cwd(), hasUI: false, model: undefined,
+		cwd: process.cwd(), isIdle() { return false; }, hasUI: false, model: options.model as any,
 		ui: { setWidget() {}, theme: { fg(_name: string, text: string) { return text; }, bg(_name: string, text: string) { return text; }, bold(text: string) { return text; } } },
 		sessionManager: {
 			getSessionId() { return "activation-session"; }, getSessionFile() { return null; }, getEntries() { return []; },
@@ -54,18 +56,21 @@ function createRuntime(messages: any[] = [], excluded: string[] = [], missingApi
 		modelRegistry: { getAvailable() { return []; } },
 	};
 	const childEnv = process.env.PI_SUBAGENT_CHILD;
+	const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "tool-activation-agent-"));
+	if (options.config) {
+		fs.mkdirSync(path.join(agentDir, "extensions", "subagent"), { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "extensions", "subagent", "config.json"), JSON.stringify(options.config));
+	}
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	delete process.env.PI_SUBAGENT_CHILD;
-	// The gate trusts the running host or an explicit override only, and this
-	// test process is neither, so declare the host it is exercising.
-	const hostRoot = declareHost ? process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] ?? resolveInstalledPiPackageRoot() : undefined;
-	const declaredHost = declareHost && process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] === undefined && hostRoot !== undefined;
-	if (declaredHost) process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = hostRoot;
 	try {
 		registerSubagentExtension(pi as any);
 	} finally {
-		if (declaredHost) delete process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
 		if (childEnv === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = childEnv;
+		if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
 	}
 	runtimes.push({ handlers, context });
 	return {
@@ -87,7 +92,7 @@ afterEach(async () => {
 describe("subagent tool activation", () => {
 	it("keeps subagent eager unless the host provides the complete dynamic-tool API", async () => {
 		for (const missing of ["getAllTools", "getActiveTools", "setActiveTools"]) {
-			const runtime = createRuntime([], [], [missing]);
+			const runtime = createRuntime([], [], [missing], DYNAMIC);
 			await runtime.emit("session_start", { type: "session_start", reason: "startup" });
 			assert.ok(runtime.active().includes("subagent"), `${missing} must fail closed to eager subagent`);
 			assert.equal(runtime.tools.has("subagents_enable"), false);
@@ -95,7 +100,7 @@ describe("subagent tool activation", () => {
 	});
 
 	it("starts fresh parents with a compact self-service loader and keeps support tools active", async () => {
-		const runtime = createRuntime();
+		const runtime = createRuntime([], [], [], DYNAMIC);
 		await runtime.emit("session_start", { type: "session_start", reason: "startup" });
 
 		assert.equal(runtime.active().includes("subagent"), false);
@@ -119,7 +124,7 @@ describe("subagent tool activation", () => {
 	it("restores native cold and warm transcript selections across start, reload, and tree navigation", async () => {
 		const tool = { name: "subagent", description: "historical", parameters: { type: "object" } };
 		const history = [{ role: "system", content: "", toolsAdded: [], timestamp: 1 }];
-		const cold = createRuntime(history);
+		const cold = createRuntime(history, [], [], DYNAMIC);
 		await cold.emit("session_start", { type: "session_start", reason: "reload" });
 		assert.equal(cold.active().includes("subagent"), false);
 		await cold.emit("session_tree", { type: "session_tree", newLeafId: null, oldLeafId: null });
@@ -128,26 +133,26 @@ describe("subagent tool activation", () => {
 		await cold.emit("session_tree", { type: "session_tree", newLeafId: null, oldLeafId: null });
 		assert.ok(cold.active().includes("subagent"));
 
-		const warm = createRuntime([{ role: "system", content: "", toolsAdded: [tool], timestamp: 1 }]);
+		const warm = createRuntime([{ role: "system", content: "", toolsAdded: [tool], timestamp: 1 }], [], [], DYNAMIC);
 		await warm.emit("session_start", { type: "session_start", reason: "resume" });
 		assert.ok(warm.active().includes("subagent"));
 		assert.ok(warm.active().includes("subagents_enable"));
 	});
 
 	it("keeps eager compatibility for legacy history and when the loader is restricted", async () => {
-		const legacy = createRuntime([{ role: "user", content: "continue", timestamp: 1 }]);
+		const legacy = createRuntime([{ role: "user", content: "continue", timestamp: 1 }], [], [], DYNAMIC);
 		await legacy.emit("session_start", { type: "session_start", reason: "startup" });
 		assert.ok(legacy.active().includes("subagent"));
 		assert.ok(legacy.active().includes("subagents_enable"));
 
-		const restricted = createRuntime([], ["subagents_enable"]);
+		const restricted = createRuntime([], ["subagents_enable"], [], DYNAMIC);
 		await restricted.emit("session_start", { type: "session_start", reason: "startup" });
 		assert.ok(restricted.active().includes("subagent"));
 		assert.equal(restricted.active().includes("subagents_enable"), false);
 	});
 
 	it("does not activate delegation from prompt keywords and reports an unavailable target", async () => {
-		const runtime = createRuntime();
+		const runtime = createRuntime([], [], [], DYNAMIC);
 		await runtime.emit("session_start", { type: "session_start", reason: "startup" });
 		runtime.select(["read"]);
 		const selectedTools = runtime.active();
@@ -174,114 +179,131 @@ describe("subagent tool activation", () => {
 	});
 });
 
-function withHostPackageRoot(manifest: Record<string, unknown> | string, run: () => void): void {
-	assert.equal(resolvePiPackageRoot(), undefined, "the test process must not look like a running host package");
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-host-root-"));
-	fs.writeFileSync(path.join(root, "package.json"), typeof manifest === "string" ? manifest : JSON.stringify(manifest));
-	const prior = process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
-	const priorPiPackageDir = process.env.PI_PACKAGE_DIR;
-	delete process.env.PI_PACKAGE_DIR;
-	process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = root;
-	try {
-		run();
-	} finally {
-		if (prior === undefined) delete process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
-		else process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = prior;
-		if (priorPiPackageDir === undefined) delete process.env.PI_PACKAGE_DIR;
-		else process.env.PI_PACKAGE_DIR = priorPiPackageDir;
-		fs.rmSync(root, { recursive: true, force: true });
-	}
-}
-
 describe("host dynamic tool support detection", () => {
-	it("compares the host version against the 0.86.1 floor", () => {
-		for (const [version, supported] of [
-			["0.85.9", false], ["0.86.0", false], ["0.86.1", true], ["0.87.0", true], ["1.0.0", true],
-			["0.86", false], ["0.86.1-rc.1", false], ["0.87.0-beta.2", false], ["v0.87.0", false], ["current", false],
-		] as const) {
-			assert.equal(supportsMinimumVersion(version), supported, `version ${version}`);
-		}
-	});
-
-	it("names the measured installation for a host below the floor", () => {
-		const hostApi = { getAllTools() {}, getActiveTools() {}, setActiveTools() {} } as any;
-		withHostPackageRoot({ name: PI_CODING_AGENT_PACKAGE, version: "0.86.0" }, () => {
-			const reason = unsupportedDynamicToolsReason(hostApi);
-			assert.match(reason ?? "", /requires Pi 0\.86\.1 or newer/);
-			assert.match(reason ?? "", /detected 0\.86\.0 in .*pi-subagents-host-root-/);
-		});
-		withHostPackageRoot({ name: PI_CODING_AGENT_PACKAGE, version: "0.88.0" }, () => {
-			assert.equal(unsupportedDynamicToolsReason(hostApi), undefined);
-		});
-	});
-
-	it("accepts a validated 0.87 Bun bin/share host image", () => {
-		const hostApi = { getAllTools() {}, getActiveTools() {}, setActiveTools() {} } as any;
-		const manifestPath = "/synthetic-host/share/pi-coding-agent/package.json";
-		assert.equal(unsupportedDynamicToolsReason(hostApi, {
-			platform: "linux",
-			bunVersion: "1.2.0",
-			argv1: "/$bunfs/root/pi",
-			execPath: "/synthetic-host/bin/pi",
-			env: {},
-			realpathSync: (value) => value,
-			existsSync: (value) => value === manifestPath,
-			readFileSync: (value) => value === manifestPath
-				? JSON.stringify({ name: PI_CODING_AGENT_PACKAGE, version: "0.87.0" })
-				: (() => { throw new Error(`unexpected read: ${value}`); })(),
-		}), undefined);
-	});
-
-	it("keeps manifest failures visible instead of falling through", () => {		const hostApi = { getAllTools() {}, getActiveTools() {}, setActiveTools() {} } as any;
-		withHostPackageRoot("{ not json", () => {
-			assert.match(unsupportedDynamicToolsReason(hostApi) ?? "", /Could not read a valid Pi package manifest at .*package\.json/);
-		});
-		withHostPackageRoot({ name: PI_CODING_AGENT_PACKAGE }, () => {
-			assert.match(unsupportedDynamicToolsReason(hostApi) ?? "", /has no version/);
-		});
-		withHostPackageRoot({ name: "@someone-else/tool", version: "0.88.0" }, () => {
-			const reason = unsupportedDynamicToolsReason(hostApi) ?? "";
-			assert.match(reason, /is not @earendil-works\/pi-coding-agent/);
-			assert.match(reason, /PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT override/);
-		});
-	});
-
-	it("refuses to gate on an SDK that is not the running host", async () => {
-		const hostApi = { getAllTools() {}, getActiveTools() {}, setActiveTools() {} } as any;
+	it("activates the loader on an in-process host with no Pi package root evidence", async () => {
 		const prior = process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
 		const priorPiPackageDir = process.env.PI_PACKAGE_DIR;
 		delete process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV];
 		delete process.env.PI_PACKAGE_DIR;
 		try {
-			assert.equal(resolvePiPackageRoot(), undefined);
-			assert.match(unsupportedDynamicToolsReason(hostApi) ?? "", /Could not verify the running Pi installation|Could not locate the running Pi installation/);
-			const runtime = createRuntime([], [], [], false);
+			assert.equal(resolvePiPackageRoot(), undefined, "the test process must not look like a running host package");
+			const runtime = createRuntime([], [], [], DYNAMIC);
 			await runtime.emit("session_start", { type: "session_start", reason: "startup" });
-			assert.equal(runtime.tools.has("subagents_enable"), false);
-			assert.ok(runtime.active().includes("subagent"));
+			assert.ok(runtime.tools.has("subagents_enable"));
+			assert.equal(runtime.active().includes("subagent"), false);
 		} finally {
 			if (prior !== undefined) process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV] = prior;
 			if (priorPiPackageDir !== undefined) process.env.PI_PACKAGE_DIR = priorPiPackageDir;
 		}
 	});
+});
 
-	it("stays eager below the floor and activates the loader at or above it", async () => {
-		let old!: ReturnType<typeof createRuntime>;
-		withHostPackageRoot({ name: PI_CODING_AGENT_PACKAGE, version: "0.86.0" }, () => { old = createRuntime(); });
-		await old.emit("session_start", { type: "session_start", reason: "startup" });
-		assert.equal(old.tools.has("subagents_enable"), false);
-		assert.ok(old.active().includes("subagent"));
+const tool = (name: string) => ({ name, description: name, parameters: { type: "object" } });
+const declared = (added: string[], removed: string[] = []) => ({
+	role: "system", content: "", toolsAdded: added.map(tool), ...(removed.length ? { toolsRemoved: removed.map((name) => ({ name })) } : {}), timestamp: 1,
+});
+const model = (api: string, compat?: Record<string, boolean>) => ({ id: "m", provider: "p", api, compat });
+const system = { supportsMidConvoSystemMessages: true };
+const COMPATIBLE = model("anthropic-messages", { ...system, supportsMidConvoToolChanges: true });
+const INCOMPATIBLE = model("openai-completions", { supportsMidConvoToolAdditions: true });
 
-		let broken!: ReturnType<typeof createRuntime>;
-		withHostPackageRoot("{ not json", () => { broken = createRuntime(); });
-		await broken.emit("session_start", { type: "session_start", reason: "startup" });
-		assert.equal(broken.tools.has("subagents_enable"), false, "a broken host manifest must fail closed");
-		assert.ok(broken.active().includes("subagent"));
+async function startAgent(runtime: ReturnType<typeof createRuntime>): Promise<string[]> {
+	const event = {
+		type: "before_agent_start", prompt: "continue", systemPrompt: "base",
+		systemPromptOptions: { selectedTools: runtime.active(), sections: {}, promptGuidelines: [] },
+	};
+	await runtime.emit("before_agent_start", event);
+	return event.systemPromptOptions.selectedTools;
+}
 
-		let supported!: ReturnType<typeof createRuntime>;
-		withHostPackageRoot({ name: PI_CODING_AGENT_PACKAGE, version: "0.88.0" }, () => { supported = createRuntime(); });
-		await supported.emit("session_start", { type: "session_start", reason: "startup" });
-		assert.ok(supported.tools.has("subagents_enable"));
-		assert.equal(supported.active().includes("subagent"), false);
+describe("toolActivation modes", () => {
+	it("defaults to auto, which starts a new session with subagent and no loader when the model cannot add tools", async () => {
+		for (const options of [{}, { config: { toolActivation: "auto" }, model: INCOMPATIBLE }]) {
+			const runtime = createRuntime([], [], [], options);
+			await runtime.emit("session_start", { type: "session_start", reason: "startup" });
+			const first = await startAgent(runtime);
+			assert.ok(first.includes("subagent") && first.includes("read"));
+			assert.equal(first.includes("subagents_enable"), false);
+			// Switching to a capable model mid-session changes nothing.
+			runtime.context.model = COMPATIBLE;
+			assert.deepEqual(await startAgent(runtime), first);
+		}
+	});
+
+	it("offers the loader in auto only when the model's API can add tools mid-conversation", async () => {
+		const cases: Array<[unknown, boolean]> = [
+			[undefined, false],
+			[model("anthropic-messages"), false],
+			[model("anthropic-messages", { ...system, supportsMidConvoToolChanges: true }), true],
+			[model("anthropic-messages", { supportsMidConvoSystemMessages: false, supportsMidConvoToolChanges: true }), false],
+			[model("anthropic-messages", { supportsMidConvoToolChanges: true }), false],
+			[model("anthropic-messages", system), false],
+			[model("openai-completions", { ...system, supportsMidConvoToolAdditions: true }), true],
+			[model("openai-completions", { ...system, supportsMidConvoToolChanges: true }), false],
+			[model("openai-responses", { ...system, supportsAdditionalTools: true }), true],
+			[model("openai-responses", { ...system, supportsToolSearch: true }), true],
+			[model("openai-responses", system), false],
+			[model("openai-codex-responses", { ...system, supportsToolSearch: true }), true],
+			[model("azure-openai-responses", { ...system, supportsAdditionalTools: true }), true],
+			[model("google-generative-ai", { ...system, supportsMidConvoToolChanges: true, supportsMidConvoToolAdditions: true, supportsAdditionalTools: true }), false],
+		];
+		for (const [caseModel, compatible] of cases) {
+			const runtime = createRuntime([], [], [], { model: caseModel });
+			await runtime.emit("session_start", { type: "session_start", reason: "startup" });
+			const selectedTools = await startAgent(runtime);
+			assert.equal(selectedTools.includes("subagents_enable"), compatible, JSON.stringify(caseModel));
+			assert.equal(selectedTools.includes("subagent"), !compatible, JSON.stringify(caseModel));
+		}
+	});
+
+	it("always offers the loader in dynamic, even to a recorded session without it", async () => {
+		for (const messages of [[], [declared(["read", "subagent"])]]) {
+			const runtime = createRuntime(messages, [], [], { ...DYNAMIC, model: INCOMPATIBLE });
+			await runtime.emit("session_start", { type: "session_start", reason: "resume" });
+			assert.ok((await startAgent(runtime)).includes("subagents_enable"));
+			assert.equal(runtime.active().includes("subagent"), messages.length > 0);
+		}
+	});
+
+	it("registers no loader in eager, even with a capable model or recorded loader history", async () => {
+		for (const messages of [[], [declared(["read", "subagents_enable"])]]) {
+			const runtime = createRuntime(messages, [], [], { config: { toolActivation: "eager" }, model: COMPATIBLE });
+			await runtime.emit("session_start", { type: "session_start", reason: "resume" });
+			assert.equal(runtime.tools.has("subagents_enable"), false);
+			const selectedTools = await startAgent(runtime);
+			assert.ok(selectedTools.includes("subagent"));
+			assert.equal(selectedTools.includes("subagents_enable"), false);
+		}
+	});
+
+	it("replays recorded sessions in auto without adding or removing tools, whatever the model", async () => {
+		const cases: Array<[string, any[], string[]]> = [
+			["cold", [declared(["read", "subagents_enable"])], ["subagents_enable"]],
+			["warm", [declared(["read", "subagents_enable"]), declared(["subagent"])], ["subagents_enable", "subagent"]],
+			["eager", [declared(["read", "subagent"])], ["subagent"]],
+			["loader removed", [declared(["read", "subagents_enable", "subagent"]), declared([], ["subagents_enable"])], ["subagent"]],
+			["legacy", [{ role: "user", content: "continue", timestamp: 1 }], ["subagents_enable", "subagent"]],
+		];
+		for (const caseModel of [COMPATIBLE, INCOMPATIBLE]) {
+			for (const [label, messages, expected] of cases) {
+				const runtime = createRuntime(messages, [], [], { model: caseModel });
+				for (const event of [
+					{ type: "session_start", reason: "resume" },
+					{ type: "session_start", reason: "reload" },
+					{ type: "session_tree", newLeafId: null, oldLeafId: null },
+				]) {
+					await runtime.emit(event.type, event);
+					const selectedTools = await startAgent(runtime);
+					for (const name of ["subagents_enable", "subagent"]) {
+						assert.equal(selectedTools.includes(name), expected.includes(name), `${label}, ${caseModel.api}, ${event.type}: ${name}`);
+						assert.equal(runtime.active().includes(name), expected.includes(name), `${label}, ${caseModel.api}, ${event.type}: active ${name}`);
+					}
+				}
+			}
+		}
+	});
+
+	it("rejects an unknown toolActivation value instead of falling back", () => {
+		assert.throws(() => createRuntime([], [], [], { config: { toolActivation: "lazy" } }), /config\.toolActivation must be "auto", "dynamic", or "eager"/);
 	});
 });

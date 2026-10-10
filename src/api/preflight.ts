@@ -2,10 +2,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverAgentSnapshot, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryAllResult, type AgentScope, type AgentSource } from "../agents/agents.ts";
-import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
+import { projectScopeRequiresTrustMessage, resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
+import { assertClaudeCodeModelScope, isClaudeCodeAdapterId, resolveClaudeCodeOverride } from "../runs/shared/claude-code-adapter.ts";
 import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
 import { buildEffectiveSystemPrompt } from "../runs/shared/effective-system-prompt.ts";
 import { normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
@@ -15,7 +16,7 @@ import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLe
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type IntercomBridgeConfig, type IntercomBridgeMode, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { resolvePermissionRules } from "../runs/shared/permissions.ts";
-import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
+import type { McpRuntimeSnapshotHost, ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
 import { canPreferForkFromSnapshot, resolveSubagentLaunchContext } from "../shared/fork-context.ts";
 import { loadConfig } from "../extension/config.ts";
@@ -26,7 +27,7 @@ import { processTerminalCandidatePath, processTerminalPath } from "../runs/backg
 import { resultFilePath } from "../runs/background/result-files.ts";
 import { nestedResultsPath } from "../runs/shared/nested-events.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../runs/shared/extension-bindings.ts";
-import { resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
+import { assertRequiredChildExtensionsAdmitted, resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
 
 // v3: the contract reports the resolved Intercom bridge state and binds its
 // prompt and tools into launchContractDigest, matching execution (#2127).
@@ -45,6 +46,7 @@ export type SubagentLaunchContractReasonCode =
 	| "unsupported_mode"
 	| "restricted_agent"
 	| "thinking_ceiling"
+	| "model_scope"
 	| "invalid_extension_bindings"
 	| "invalid_intercom_bridge";
 
@@ -61,6 +63,8 @@ export interface SubagentLaunchContractInput {
 	cwd: string;
 	task?: string;
 	agentScope?: AgentScope;
+	/** False when the parent session declined project trust; project agents and project subagent settings are then ignored. Defaults to true. */
+	projectTrusted?: boolean;
 	context?: "fresh" | "fork";
 	model?: string;
 	fast?: boolean;
@@ -68,6 +72,8 @@ export interface SubagentLaunchContractInput {
 	thinkingCeiling?: ThinkingLevel;
 	inheritedThinkingCeiling?: ThinkingLevel;
 	parentModel?: ParentModel;
+	/** Scoped-model snapshot (`provider/id` strings); drives the `scoped` allow token. Omitting it degrades `scoped` to `inherit`, so callers comparing preflight with execution must pass the session snapshot. */
+	scopedModelIds?: readonly string[];
 	availableModels?: ReadonlyArray<AvailableModelInfo | { provider: string; id: string; fullId?: string; reasoning?: boolean }>;
 	preferredProvider?: string;
 	skill?: string | string[] | boolean;
@@ -90,6 +96,8 @@ export interface SubagentLaunchContractInput {
 	nestedRootRunId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** The calling extension's `pi`, so `mcp:` selectors resolve against the MCP the launch uses. Without it, preflight cannot see Pi's built-in MCP and resolves through pi-mcp-adapter's configuration. */
+	runtimeSnapshotHost?: McpRuntimeSnapshotHost;
 	/** Per-launch bridge config; replaces the global `intercomBridge` config exactly as the tool and delegation overrides do. */
 	intercomBridge?: IntercomBridgeConfig;
 	/**
@@ -201,6 +209,17 @@ export type SubagentLaunchContractResult =
 	| { ok: true; contract: SubagentLaunchContract }
 	| { ok: false; code: SubagentLaunchContractReasonCode; message: string; diagnostics: SubagentLaunchContractDiagnostic[] };
 
+/**
+ * Classify a Claude Code override failure for the launch contract. The messages
+ * are owned by the adapter and the scope check, so this maps them explicitly
+ * instead of defaulting every rejection to the ceiling.
+ */
+function claudeCodeFailureCode(message: string): SubagentLaunchContractReasonCode {
+	if (message.includes("subagent model scope")) return "model_scope";
+	if (message.startsWith("Thinking level '")) return "thinking_ceiling";
+	return "unsupported_mode";
+}
+
 function packageVersion(): string {
 	const packagePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
 	const parsed = JSON.parse(fs.readFileSync(packagePath, "utf-8")) as { version?: unknown };
@@ -291,8 +310,12 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		return { ok: false, code: "invalid_intercom_bridge", message: "orchestratorTarget must be a non-empty string when provided.", diagnostics };
 	}
 	const scope = resolveExecutionAgentScope(input.agentScope);
+	if (input.projectTrusted === false && scope === "project") {
+		const message = projectScopeRequiresTrustMessage(effectiveCwd);
+		return { ok: false, code: "restricted_agent", message, diagnostics: [...diagnostics, { code: "restricted_agent", severity: "error", message }] };
+	}
 	const parentProvider = input.preferredProvider ?? input.parentModel?.provider;
-	const discovery = discoverAgentSnapshot(effectiveCwd, scope, parentProvider, { includeChains: false });
+	const discovery = discoverAgentSnapshot(effectiveCwd, scope, parentProvider, { includeChains: false, projectTrusted: input.projectTrusted });
 	const discovered = discovery.effective;
 	const resolvedAgent = resolveAgentName(input.agent, discovered.agents);
 	const ambiguousCandidates = resolvedAgent.error
@@ -362,12 +385,19 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (resolvedSkills.missing.length > 0) diagnostics.push({ code: "missing_skill", severity: "error", message: `Missing skills: ${resolvedSkills.missing.join(", ")}` });
 
 	const externalRunner = agent.runner?.type === "external-cli" || agent.runner?.type === "external-job";
+	// Machine placement has no preflight input; execution enforces it. Preview the runner-type admission here.
+	try {
+		assertRequiredChildExtensionsAdmitted([resolveRequiredChildExtensions(input.parentSessionId)], { agent: agent.name, runnerType: agent.runner?.type });
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, code: "unsupported_mode", message, diagnostics };
+	}
 	if (externalRunner && behavior.outputSchema) {
 		return { ok: false, code: "unsupported_mode", message: `Agent '${agent.name}' uses runner.type='${agent.runner?.type}' and does not support: structured output.`, diagnostics };
 	}
 	const availableModels = normalizeAvailableModels(input.availableModels);
 	const preferredProvider = agent.modelProvider ?? input.preferredProvider ?? input.parentModel?.provider;
-	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel);
+	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel, input.scopedModelIds);
 	const modelOrigin = resolveModelOrigin({ explicitModel: input.model, agentModel: agent.model, parentModel: input.parentModel });
 	const primaryModel = externalRunner
 		? undefined
@@ -395,6 +425,27 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			return { ok: false, code: "thinking_ceiling", message, diagnostics };
 		}
 	}
+	// The Claude Code adapters accept a model and a level that never become a Pi child
+	// model, so validate has to run the same two checks the launch runs, or validate
+	// would report ok for a launch that then fails.
+	if (agent.runner?.type === "external-cli" && isClaudeCodeAdapterId(agent.runner.adapter)) {
+		try {
+			const override = resolveClaudeCodeOverride({
+				model: typeof input.model === "string" ? input.model : undefined,
+				agent,
+				thinking: typeof effectiveThinkingConfig === "string" ? effectiveThinkingConfig : undefined,
+				thinkingCeiling: intersectThinkingCeilings(discovered.maxThinking, input.thinkingCeiling, input.inheritedThinkingCeiling),
+				agentName: agent.name,
+				runId,
+			});
+			assertClaudeCodeModelScope({ scopes: modelScopes, model: override?.model, agent: agent.name, runId });
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const code = claudeCodeFailureCode(message);
+			diagnostics.push({ code, severity: "error", message });
+			return { ok: false, code, message, diagnostics };
+		}
+	}
 	let toolPlan: PiLaunchToolPlan;
 	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions);
 	const fast = input.fast ?? agent.fast;
@@ -416,6 +467,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 			permissionRules,
+			runtimeSnapshotHost: input.runtimeSnapshotHost,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -451,7 +503,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		model,
 		...(fast !== undefined ? { fast } : {}),
 		...(effectiveThinking ? { thinking: effectiveThinking } : {}),
-		systemPrompt: buildEffectiveSystemPrompt({ agent, resolvedSkills: resolvedSkills.resolved, cwd: effectiveCwd, ...(outputPath ? { outputPath } : {}) }),
+		systemPrompt: buildEffectiveSystemPrompt({ agent, resolvedSkills: resolvedSkills.resolved, cwd: effectiveCwd }),
 		skills: requestedSkills,
 		toolPlan,
 		...(outputPath ? { outputPath } : {}),

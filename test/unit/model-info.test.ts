@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, type ModelInfo } from "../../src/shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, qualifyModelWithProvider, splitKnownThinkingSuffix, toModelInfo, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -38,6 +38,21 @@ describe("model info helpers", () => {
 
 	it("preserves registry API metadata", () => {
 		assert.equal(toModelInfo({ provider: "gateway", id: "model", api: "anthropic-messages" }).api, "anthropic-messages");
+	});
+
+	it("qualifies an observed model id with its provider without double-prefixing", () => {
+		assert.equal(qualifyModelWithProvider("claude-haiku-4-5", "anthropic"), "anthropic/claude-haiku-4-5");
+		assert.equal(qualifyModelWithProvider("anthropic/claude-haiku-4-5", "anthropic"), "anthropic/claude-haiku-4-5");
+		// A provider-local slash id is prefixed with the real provider, not mistaken for one.
+		assert.equal(qualifyModelWithProvider("openai/gpt-5-mini", "openrouter"), "openrouter/openai/gpt-5-mini");
+		assert.equal(qualifyModelWithProvider("openrouter/openai/gpt-5-mini", "openrouter"), "openrouter/openai/gpt-5-mini");
+		assert.equal(qualifyModelWithProvider("gpt-5-mini", undefined), "gpt-5-mini");
+		assert.equal(qualifyModelWithProvider(undefined, "anthropic"), undefined);
+		assert.equal(qualifyModelWithProvider("", "anthropic"), undefined);
+		// With the registry, a provider-local id that repeats its provider keeps the canonical doubled form.
+		const openrouterCatalog: ModelInfo[] = [{ provider: "openrouter", id: "openrouter/auto-beta", fullId: "openrouter/openrouter/auto-beta" }];
+		assert.equal(qualifyModelWithProvider("openrouter/auto-beta", "openrouter", openrouterCatalog), "openrouter/openrouter/auto-beta");
+		assert.equal(qualifyModelWithProvider("openrouter/openrouter/auto-beta", "openrouter", openrouterCatalog), "openrouter/openrouter/auto-beta");
 	});
 
 	it("keeps the legacy thinking list for models without per-level metadata", () => {

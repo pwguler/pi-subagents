@@ -62,7 +62,7 @@ describe("async chain root attachment", () => {
 			usage: result.usage,
 		}, {
 			agent: "worker",
-			importedPublication: { sessionId: "publication-session", toolCallId: "publication-tool-call" },
+			importedPublication: { sessionId: "publication-session", toolCallId: "publication-tool-call", snapshot: fs.readFileSync(importedRoot.resultPath, "utf-8") },
 			output: "root output",
 			exitCode: 0,
 			sessionFile,
@@ -176,7 +176,7 @@ describe("async chain root attachment", () => {
 		assert.equal(result.exitCode, 1);
 		assert.equal(result.error, "root failed");
 		assert.equal(result.output, "root failed");
-		assert.deepEqual(result.importedPublication, {});
+		assert.deepEqual(result.importedPublication, { snapshot: fs.readFileSync(importedRoot.resultPath, "utf-8") });
 	});
 
 	it("imports a partial root without collapsing it to failed", async () => {

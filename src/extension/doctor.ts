@@ -2,16 +2,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { discoverAgentsAll, type AgentSource } from "../agents/agents.ts";
 import { isAsyncAvailable } from "../runs/background/async-execution.ts";
-import { formatSpawnBudgetSummary, getSpawnBudgetSnapshot } from "../runs/shared/spawn-budget.ts";
-import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
-
+import { formatSpawnBudgetSummary } from "../runs/shared/spawn-budget.ts";
 import { diagnoseIntercomBridge, type IntercomBridgeDiagnostic } from "../intercom/intercom-bridge.ts";
 import { discoverAvailableSkills, type SkillSource } from "../agents/skills.ts";
 import {
 	DIRS,
 	CHAIN_RUNS_DIR,
 	TEMP_ROOT_DIR,
+	type ActiveAsyncCapacitySnapshot,
 	type ExtensionConfig,
+	type SpawnBudgetSnapshot,
 	type SubagentState,
 	normalizeMaxSubagentSpawnsPerRun,
 	resolveMaxSubagentSpawnsPerRun,
@@ -39,6 +39,8 @@ interface DoctorReportInput {
 	requestedSessionDir?: string;
 	currentSessionFile?: string | null;
 	currentSessionId?: string | null;
+	spawnBudget: SpawnBudgetSnapshot;
+	activeAsyncCapacity: ActiveAsyncCapacitySnapshot;
 	orchestratorTarget?: string;
 	sessionError?: string;
 	expandTilde?: (value: string) => string;
@@ -167,7 +169,7 @@ function formatIntercomDiagnostic(diagnostic: IntercomBridgeDiagnostic, context:
 }
 
 function formatSpawnBudgetSection(input: DoctorReportInput): string[] {
-	const snapshot = getSpawnBudgetSnapshot(input.state, input.config, input.currentSessionId ?? input.state.currentSessionId);
+	const snapshot = input.spawnBudget;
 	return [
 		`- usage: ${formatSpawnBudgetSummary(snapshot)}`,
 		`- recent grants: ${snapshot.grantHistory.length === 0
@@ -186,12 +188,7 @@ function formatRunFanoutSection(input: DoctorReportInput): string[] {
 }
 
 function formatActiveAsyncCapacitySection(input: DoctorReportInput): string[] {
-	const limit = resolveMaxActiveAsyncRunsPerSession(input.config.maxActiveAsyncRunsPerSession);
-	const sessionId = input.currentSessionId ?? input.state.currentSessionId;
-	const snapshot = sessionId
-		? getActiveAsyncCapacitySnapshot(sessionId, limit, { liveWorkflowRunIds: new Set(input.state.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(input.config.capacity?.abandonedSlotReleaseAfterMs) })
-		: { used: 0, limit: limit ?? 0 };
-	input.state.activeAsyncCapacity = snapshot;
+	const snapshot = input.activeAsyncCapacity;
 	return [
 		`- usage: ${snapshot.used}/${snapshot.limit || "unlimited"} used`,
 		"- scope: top-level async runs in the current parent session; foreground and nested workflow children are not charged again",
@@ -223,6 +220,7 @@ function formatPermissionSystemSection(): string[] {
 
 function formatWorkflowScriptSection(): string[] {
 	return [
+		"- launch: write a ```js workflow block in the reply, then call subagent({ workflow: true }); or pass a file as workflow: \"./path.js\"",
 		"- helpers: runs.run, runs.all, runs.steer, runs.status, runs.ref/refs, emit, console",
 		"- recovery: if runs.all is missing, reload or update pi-subagents; await Promise.all([runs.run(...)]) is also supported",
 	];

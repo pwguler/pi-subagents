@@ -13,8 +13,8 @@ describe("status format helpers", () => {
 	});
 
 	it("formats max thinking from model suffixes and explicit metadata", () => {
-		assert.equal(formatModelThinking("openai/gpt-5:max"), "gpt-5 · thinking max");
-		assert.equal(formatModelThinking("openai/gpt-5", "max"), "gpt-5 · thinking max");
+		assert.equal(formatModelThinking("openai/gpt-5:max"), "openai/gpt-5 · thinking max");
+		assert.equal(formatModelThinking("openai/gpt-5", "max"), "openai/gpt-5 · thinking max");
 	});
 
 	it("aggregates step status and parallel outcomes", () => {

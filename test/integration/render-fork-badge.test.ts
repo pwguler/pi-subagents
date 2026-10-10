@@ -880,7 +880,7 @@ describe("renderSubagentResult fork indicator", () => {
 				}],
 			},
 		}, { expanded: false }, theme).render(160).join("\n");
-		assert.match(single, /reviewer \(gpt-5\.5 · thinking high\)/);
+		assert.match(single, /reviewer \(openai-codex\/gpt-5\.5 · thinking high\)/);
 
 		const multi = renderSubagentResult!({
 			content: [{ type: "text", text: "(running...)" }],
@@ -893,8 +893,8 @@ describe("renderSubagentResult fork indicator", () => {
 				],
 			},
 		}, { expanded: false }, theme).render(160).join("\n");
-		assert.match(multi, /scan \(claude-haiku-4-5 · thinking low\)/);
-		assert.match(multi, /fix \(gpt-5-mini\)/);
+		assert.match(multi, /scan \(anthropic\/claude-haiku-4-5 · thinking low\)/);
+		assert.match(multi, /fix \(openai\/gpt-5-mini\)/);
 
 		const expanded = renderSubagentResult!({
 			content: [{ type: "text", text: "done" }],
@@ -911,7 +911,26 @@ describe("renderSubagentResult fork indicator", () => {
 				}],
 			},
 		}, { expanded: true }, theme).render(160).join("\n");
-		assert.match(expanded, /review \(gpt-5\.5 · thinking high\)/);
+		assert.match(expanded, /review \(openai-codex\/gpt-5\.5 · thinking high\)/);
+
+		const expandedSingle = renderSubagentResult!({
+			content: [{ type: "text", text: "done" }],
+			details: {
+				mode: "single",
+				results: [{
+					agent: "reviewer",
+					task: "review",
+					model: "router/auto",
+					exitCode: 0,
+					messages: [],
+					finalOutput: "done",
+					usage: emptyUsage,
+					progress: { index: 0, agent: "reviewer", status: "completed", task: "review", model: "openai-codex/gpt-6.1-sol", recentTools: [], recentOutput: [], toolCount: 0, tokens: 0, durationMs: 1 },
+				}],
+			},
+		}, { expanded: true }, theme).render(160).join("\n");
+		assert.match(expandedSingle, /openai-codex\/gpt-6\.1-sol/);
+		assert.doesNotMatch(expandedSingle, /router\/auto/);
 	});
 
 	it("strips repeated agent prefixes in expanded running multi-result rows", () => {

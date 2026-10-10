@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import nodeFs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -17,6 +19,7 @@ import {
 	type ScheduledRunManager,
 } from "../../src/runs/background/scheduled-runs.ts";
 import type { ExtensionConfig } from "../../src/shared/types.ts";
+import { createMission, readMission, resolveMissionStoreLocation } from "../../src/missions/store.ts";
 
 type Timer = { callback: () => void; delay: number };
 class FakeTimers {
@@ -71,7 +74,7 @@ function context(cwd: string, sessionId = "session-a"): ExtensionContext {
 	} as unknown as ExtensionContext;
 }
 
-function harness(options: { cwd?: string; sessionId?: string; now?: number; config?: ExtensionConfig; randomId?: () => string } = {}): Harness {
+function harness(options: { cwd?: string; sessionId?: string; now?: number; config?: ExtensionConfig; randomId?: () => string; kill?: (pid: number) => boolean } = {}): Harness {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-test-"));
 	roots.push(root);
 	const project = options.cwd ?? path.join(root, "project");
@@ -88,6 +91,7 @@ function harness(options: { cwd?: string; sessionId?: string; now?: number; conf
 		randomId: options.randomId ?? (() => `id-${++id}`),
 		timers,
 		launch: (params, launchCtx) => new Promise((resolve) => launches.push({ params: params as Record<string, unknown>, ctx: launchCtx, resolve: resolve as Launch["resolve"] })) as never,
+		kill: options.kill,
 	});
 	manager.bindSession(ctx);
 	return { manager, ctx, clock, timers, launches, root };
@@ -104,6 +108,150 @@ function detailRecords(result: Awaited<ReturnType<ScheduledRunManager["handleToo
 async function flush(): Promise<void> {
 	for (let i = 0; i < 8; i++) await Promise.resolve();
 }
+
+describe("calendar schedule execution", () => {
+	const script = "return runs.run('main', { agent: 'reviewer' })";
+	async function daily(h: Harness, extra: Record<string, unknown> = {}) {
+		const result = await h.manager.handleToolCall({ action: "schedule.create", id: "calendar", every: "day", at: "09:00", timezone: "Asia/Taipei", workflowScript: script, ...extra }, h.ctx);
+		assert.equal(result.isError, undefined, text(result));
+		return result;
+	}
+	async function trigger(h: Harness) {
+		return detailRecords(await h.manager.handleToolCall({ action: "schedule.show", id: "calendar" }, h.ctx))[0]!.trigger as Record<string, unknown>;
+	}
+	it("persists daily and weekly rules, displays the zone, and rearms an early timer", async () => {
+		const h = harness();
+		await daily(h, { every: "week", on: ["fri", "tue", "fri"], quiet: true });
+		assert.deepEqual((await trigger(h)).on, ["tue", "fri"]);
+		assert.equal((await trigger(h)).nextLocalDate, "2030-01-01");
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.show", id: "calendar" }, h.ctx)), /every week.*09:00 Asia\/Taipei/);
+		h.timers.fireAll();
+		await flush();
+		assert.equal(h.launches.length, 0);
+		assert.equal(h.timers.values.size, 1);
+		h.clock.now = Date.parse("2030-01-01T01:00:00Z");
+		h.timers.fireAll();
+		await flush();
+		assert.equal((h.launches[0]!.params.scheduleOrigin as Record<string, unknown>).quiet, true);
+		h.launches[0]!.resolve({ content: [], details: { asyncId: "calendar-run" } });
+		await flush();
+		assert.equal((await trigger(h)).nextLocalDate, "2030-01-04");
+	});
+	it("runs only the latest missed date after a long pause", async () => {
+		const h = harness();
+		await daily(h);
+		await h.manager.handleToolCall({ action: "schedule.pause", id: "calendar" }, h.ctx);
+		h.clock.now = Date.parse("2035-01-01T02:00:00Z");
+		await h.manager.handleToolCall({ action: "schedule.resume", id: "calendar" }, h.ctx);
+		const due = h.manager.handleToolCall({ action: "schedule.run-due" }, h.ctx);
+		await flush();
+		h.launches[0]!.resolve({ content: [], details: { asyncId: "latest" } });
+		const result = await due;
+		assert.equal(result.details?.schedules?.runs?.[0]?.plannedAt, "2035-01-01T01:00:00.000Z");
+		assert.equal(h.launches.length, 1);
+		assert.equal((await trigger(h)).nextLocalDate, "2035-01-02");
+	});
+	it("records one missed receipt for catchUp:none and advances past downtime", async () => {
+		const h = harness();
+		await daily(h, { catchUp: "none" });
+		await h.manager.handleToolCall({ action: "schedule.pause", id: "calendar" }, h.ctx);
+		h.clock.now = Date.parse("2035-01-01T02:00:00Z");
+		await h.manager.handleToolCall({ action: "schedule.resume", id: "calendar" }, h.ctx);
+		const history = await h.manager.handleToolCall({ action: "schedule.history", id: "calendar" }, h.ctx);
+		assert.equal(history.details?.schedules?.runs?.length, 1);
+		assert.equal(history.details?.schedules?.runs?.[0]?.state, "missed");
+		assert.equal(h.launches.length, 0);
+		assert.equal((await trigger(h)).nextLocalDate, "2035-01-02");
+	});
+	it("successful manual attachment satisfies the pending future date", async () => {
+		const h = harness();
+		await daily(h);
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "calendar" }, h.ctx);
+		await flush();
+		h.launches[0]!.resolve({ content: [], details: { asyncId: "manual" } });
+		await manual;
+		assert.equal((await trigger(h)).nextLocalDate, "2030-01-02");
+		assert.equal((await trigger(h)).nextRunAt, "2030-01-02T01:00:00.000Z");
+	});
+	it("failed manual attachment preserves both pending fields", async () => {
+		const h = harness();
+		await daily(h);
+		const before = await trigger(h);
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "calendar" }, h.ctx);
+		await flush();
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "launch rejected" }], details: {}, isError: true });
+		assert.equal((await manual).isError, true);
+		assert.deepEqual(await trigger(h), before);
+	});
+	for (const paused of [false, true]) it(`restores an overlapped calendar fire after failed manual attachment, paused: ${paused}`, async () => {
+		const h = harness();
+		await daily(h);
+		const before = await trigger(h);
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "calendar" }, h.ctx);
+		await flush();
+		h.clock.now = Date.parse("2030-01-01T01:00:00Z");
+		h.timers.fireAll();
+		await flush();
+		assert.equal((await trigger(h)).nextLocalDate, "2030-01-02");
+		if (paused) await h.manager.handleToolCall({ action: "schedule.pause", id: "calendar" }, h.ctx);
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "launch rejected" }], details: {}, isError: true });
+		assert.equal((await manual).isError, true);
+		assert.deepEqual(await trigger(h), before);
+		assert.equal(detailRecords(await h.manager.handleToolCall({ action: "schedule.show", id: "calendar" }, h.ctx))[0]!.paused, paused);
+		assert.equal(h.launches.length, 1);
+		if (paused) assert.equal(h.timers.values.size, 0);
+		else {
+			h.timers.fireAll();
+			await flush();
+			assert.equal(h.launches.length, 2);
+			h.launches[1]!.resolve({ content: [], details: { asyncId: "natural-retry" } });
+			await flush();
+			assert.equal((await trigger(h)).nextLocalDate, "2030-01-02");
+			assert.equal((await trigger(h)).nextRunAt, "2030-01-02T01:00:00.000Z");
+		}
+	});
+	it("does not consume an extra date when a natural fire overlaps manual attachment", async () => {
+		const h = harness();
+		await daily(h);
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "calendar" }, h.ctx);
+		await flush();
+		h.clock.now = Date.parse("2030-01-01T01:00:00Z");
+		h.timers.fireAll();
+		await flush();
+		h.launches[0]!.resolve({ content: [], details: { asyncId: "manual-overlap" } });
+		await manual;
+		assert.equal((await trigger(h)).nextLocalDate, "2030-01-02");
+		assert.equal(h.launches.length, 1);
+	});
+	it("re-resolves the pending date on restoration without list rewriting the cache", async () => {
+		const h = harness();
+		await daily(h);
+		const file = path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), "calendar", "schedule.json");
+		const saved = JSON.parse(fs.readFileSync(file, "utf-8"));
+		saved.trigger.nextRunAt = "2030-01-01T03:00:00.000Z";
+		fs.writeFileSync(file, JSON.stringify(saved));
+		await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx);
+		assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).trigger.nextRunAt, saved.trigger.nextRunAt);
+		h.manager.stop();
+		h.manager.bindSession(h.ctx);
+		assert.equal(JSON.parse(fs.readFileSync(file, "utf-8")).trigger.nextRunAt, "2030-01-01T01:00:00.000Z");
+	});
+	it("does not fire twice during a repeated hour, including restoration", async () => {
+		const h = harness({ now: Date.parse("2026-11-01T04:00:00Z") });
+		await daily(h, { at: "01:30", timezone: "America/New_York" });
+		h.clock.now = Date.parse("2026-11-01T05:30:00Z");
+		h.timers.fireAll();
+		await flush();
+		h.launches[0]!.resolve({ content: [], details: { asyncId: "fold" } });
+		await flush();
+		h.manager.handleAsyncCompletion({ id: "fold", success: true });
+		h.clock.now = Date.parse("2026-11-01T06:45:00Z");
+		h.manager.bindSession(h.ctx);
+		await h.manager.handleToolCall({ action: "schedule.run-due" }, h.ctx);
+		assert.equal(h.launches.length, 1);
+		assert.equal((await trigger(h)).nextRunAt, "2026-11-02T06:30:00.000Z");
+	});
+});
 
 describe("schedule helpers", () => {
 	it("recognizes only the dot-action schedule API", () => {
@@ -290,11 +438,11 @@ describe("project schedule management", () => {
 		assert.doesNotThrow(() => manager.bindSession(context(project)));
 	});
 
-	it("rejects direct schedule targets and requires workflowScript", async () => {
+	it("rejects direct schedule targets and requires a workflow script", async () => {
 		const h = harness();
 		const result = await h.manager.handleToolCall({ action: "schedule.create", id: "direct", every: "1h", agent: "worker", task: "Review" }, h.ctx);
 		assert.equal(result.isError, true);
-		assert.match(text(result), /requires workflowScript/);
+		assert.match(text(result), /requires workflow: true or a workflow script path/);
 	});
 
 	it("fails closed on persisted legacy agent targets", () => {
@@ -324,21 +472,21 @@ describe("project schedule management", () => {
 			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
 		});
 
-		assert.throws(() => manager.bindSession(context(h.ctx.cwd, "session-b")), /removed legacy agent target.*target\.workflowScript/i);
+		assert.throws(() => manager.bindSession(context(h.ctx.cwd, "session-b")), /removed legacy agent target.*schedule\.create and workflow: true or a workflow script path/i);
 	});
 
 	it("supports workflowScript targets and rejects unsafe or deferred shapes", async () => {
 		const h = harness();
 		const workflow = await h.manager.handleToolCall({ action: "schedule.create", id: "workflow", every: "6h", workflowScript: "return await runs.run('review', {agent:'reviewer'})" }, h.ctx);
 		assert.equal(workflow.isError, undefined);
-		assert.match(text(workflow), /workflowScript -> agent reviewer/);
+		assert.match(text(workflow), /workflow -> agent reviewer/);
 		const dynamic = await h.manager.handleToolCall({ action: "schedule.create", id: "dynamic", every: "6h", workflowScript: "const agent = 'worker'; return runs.run('main', { agent })" }, h.ctx);
 		assert.equal(dynamic.isError, undefined);
-		assert.match(text(dynamic), /workflowScript \(dynamic\)/);
+		assert.match(text(dynamic), /workflow \(dynamic\)/);
 		for (const params of [
 			{ action: "schedule.create", id: "../escape", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })" },
 			{ action: "schedule.create", id: "both", at: "+1h", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })" },
-			{ action: "schedule.create", id: "calendar", every: "day", at: "09:00", timezone: "UTC", workflowScript: "return runs.run('main', { agent: 'worker' })" },
+			{ action: "schedule.create", id: "calendar", every: "day", at: "09:00", workflowScript: "return runs.run('main', { agent: 'worker' })" },
 			{ action: "schedule.create", id: "two-targets", every: "1h", agent: "worker", workflowScript: "return 1" },
 			{ action: "schedule.create", id: "fork", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", context: "fork" },
 			{ action: "schedule.create", id: "invalid-base-ref", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", baseRef: "unsafe..ref" },
@@ -388,6 +536,105 @@ describe("project schedule management", () => {
 		restoredLaunches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "workflow", results: [], asyncId: "base-ref-async" } });
 		const result = await running;
 		assert.equal(result.isError, undefined);
+	});
+
+	it("attaches an existing mission without activating it and forwards it on manual and due fires", async () => {
+		const config: ExtensionConfig = { missions: { directory: ".missions", globalIndex: false, enabled: false } };
+		const h = harness({ config });
+		const location = resolveMissionStoreLocation({ projectRoot: h.ctx.cwd, config: config.missions });
+		const mission = createMission(location, { title: "Backlog", objective: "Track progress" });
+		const created = await h.manager.handleToolCall({ action: "schedule.create", id: "mission", every: "1h", workflowScript: "return 1", missionId: mission.id }, h.ctx);
+		assert.equal(created.isError, undefined);
+		assert.deepEqual(readMission(location, mission.id), mission, "scheduling must not activate the mission");
+		assert.equal((detailRecords(created)[0]?.target as { missionId?: string }).missionId, mission.id);
+		assert.equal(detailRecords(created)[0]?.schemaVersion, 2, "old readers must reject a mission-bound definition");
+		assert.match(text(created), new RegExp(`Mission: ${mission.id}`));
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.show", id: "mission" }, h.ctx)), new RegExp(`Mission: ${mission.id}`));
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx)), new RegExp(`mission ${mission.id}`));
+		for (const [index, action] of ["schedule.run", "schedule.run-due"].entries()) {
+			if (index) h.clock.now += 3_600_000;
+			const pending = h.manager.handleToolCall({ action, id: "mission" }, h.ctx);
+			await flush();
+			const launch = h.launches[index]!;
+			assert.equal(launch.params.missionId, mission.id);
+			assert.equal(Object.hasOwn(launch.params, "mission"), false, "mission:false conflicts with an explicit ID");
+			const asyncId = `mission-${index}`;
+			launch.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "workflow", results: [], asyncId } });
+			assert.equal((await pending).isError, undefined);
+			h.manager.handleAsyncCompletion({ id: asyncId, success: true });
+		}
+	});
+
+	it("rejects missing or invalid mission attachment without persisting a schedule", async () => {
+		const h = harness({ config: { missions: { directory: ".missions", globalIndex: false } } });
+		for (const missionId of ["missing", "../escape", "", null]) {
+			const result = await h.manager.handleToolCall({ action: "schedule.create", id: "rejected", every: "1h", workflowScript: "return 1", missionId } as never, h.ctx);
+			assert.equal(result.isError, true);
+			assert.match(text(result), /missionId|was not found/);
+		}
+		assert.deepEqual(listScheduledRunSummaries(h.ctx.cwd, path.join(h.root, "stores")), []);
+		assert.equal(h.launches.length, 0);
+	});
+
+	it("resolves mission attachment from the target cwd and configured store", async () => {
+		const h = harness({ config: { missions: { directory: ".missions", globalIndex: false } } });
+		const targetCwd = path.join(h.root, "target-project");
+		fs.mkdirSync(targetCwd);
+		const location = resolveMissionStoreLocation({ projectRoot: targetCwd, config: { directory: ".missions", globalIndex: false } });
+		const mission = createMission(location, { title: "Target project", objective: "Keep project state" });
+		const request = { action: "schedule.create", id: "target-mission", every: "1h", workflowScript: "return 1", missionId: mission.id };
+		const wrongStore = await h.manager.handleToolCall(request, h.ctx);
+		assert.equal(wrongStore.isError, true);
+		h.manager.bindSession(context(targetCwd, "target-session"));
+		h.manager.bindSession(h.ctx);
+		const created = await h.manager.handleToolCall({ ...request, cwd: targetCwd }, h.ctx);
+		assert.equal(created.isError, undefined, text(created));
+		assert.equal(detailRecords(created)[0]?.cwd, targetCwd);
+		assert.deepEqual(readMission(location, mission.id), mission);
+
+		const shared = harness({ config: { missions: { directory: location.missionDir, globalIndex: false } } });
+		const sharedResult = await shared.manager.handleToolCall(request, shared.ctx);
+		assert.equal(sharedResult.isError, undefined, "an explicit shared store retains ordinary mission lookup semantics");
+		assert.deepEqual(readMission(location, mission.id), mission);
+	});
+
+	it("rejects a malformed persisted mission ID instead of dropping the attachment", async () => {
+		const config: ExtensionConfig = { missions: { directory: ".missions", globalIndex: false } };
+		const h = harness({ config });
+		const location = resolveMissionStoreLocation({ projectRoot: h.ctx.cwd, config: config.missions });
+		const mission = createMission(location, { title: "Backlog", objective: "Track progress" });
+		await h.manager.handleToolCall({ action: "schedule.create", id: "tampered-mission", every: "1h", workflowScript: "return 1", missionId: mission.id }, h.ctx);
+		h.manager.stop();
+		const file = path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), "tampered-mission", "schedule.json");
+		const record = JSON.parse(fs.readFileSync(file, "utf-8"));
+		record.target.missionId = null;
+		fs.writeFileSync(file, JSON.stringify(record));
+		assert.throws(() => h.manager.bindSession(h.ctx), /invalid missionId/);
+		assert.equal(h.timers.values.size, 0);
+		assert.equal(h.launches.length, 0);
+	});
+
+	it("keeps unbound definitions readable and rejects inconsistent attachment versions", async () => {
+		const config: ExtensionConfig = { missions: { directory: ".missions", globalIndex: false } };
+		const h = harness({ config });
+		const plain = await h.manager.handleToolCall({ action: "schedule.create", id: "plain", every: "1h", workflowScript: "return 1" }, h.ctx);
+		assert.equal(detailRecords(plain)[0]?.schemaVersion, 1);
+		const location = resolveMissionStoreLocation({ projectRoot: h.ctx.cwd, config: config.missions });
+		const mission = createMission(location, { title: "Backlog", objective: "Track progress" });
+		await h.manager.handleToolCall({ action: "schedule.create", id: "bound", every: "1h", workflowScript: "return 1", missionId: mission.id }, h.ctx);
+		h.manager.stop();
+		const file = path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), "bound", "schedule.json");
+		const record = JSON.parse(fs.readFileSync(file, "utf-8"));
+		for (const malformed of [
+			{ ...record, schemaVersion: 1 },
+			{ ...record, target: { workflowScript: record.target.workflowScript, args: record.target.args } },
+		]) {
+			fs.writeFileSync(file, JSON.stringify(malformed));
+			const rejected = await h.manager.handleToolCall({ action: "schedule.run", id: "bound" }, h.ctx);
+			assert.equal(rejected.isError, true);
+			assert.match(text(rejected), /requires schemaVersion 2/);
+		}
+		assert.equal(h.launches.length, 0);
 	});
 
 	it("pauses, resumes, lists, and deletes an inactive schedule", async () => {
@@ -564,6 +811,41 @@ describe("project schedule management", () => {
 		assert.equal(fs.existsSync(path.join(outside, "schedules")), false);
 	});
 
+	it("allows the home directory's own .pi symlinked outside home, but not a project's .pi linked to it", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-home-link-"));
+		roots.push(root);
+		const home = path.join(root, "home");
+		const config = path.join(root, "pi-config");
+		const project = path.join(root, "project");
+		fs.mkdirSync(home);
+		fs.mkdirSync(config);
+		fs.mkdirSync(project);
+		const linkType = process.platform === "win32" ? "junction" : "dir";
+		fs.symlinkSync(config, path.join(home, ".pi"), linkType);
+		fs.symlinkSync(config, path.join(project, ".pi"), linkType);
+		const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		try {
+			const manager = () => createScheduledRunManager({
+				config: { scheduledRuns: { enabled: true } },
+				launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+			});
+			const homeManager = manager();
+			const ctx = context(home);
+			homeManager.bindSession(ctx);
+			const result = await homeManager.handleToolCall({ action: "schedule.create", id: "home", every: "1h", workflowScript: "return 1" }, ctx);
+			assert.equal(result.isError, undefined);
+			assert.equal(fs.existsSync(path.join(config, "subagents", "schedules", "home", "schedule.json")), true);
+			assert.throws(() => manager().bindSession(context(project)), /resolves outside the real project/);
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	it("allows a default project schedule root through a shared Git worktree .pi symlink", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-schedule-worktree-link-"));
 		roots.push(root);
@@ -687,7 +969,7 @@ describe("quiet schedules", () => {
 
 		h.clock.now += 3_600_000;
 		h.timers.fireAll();
-		assert.deepEqual(h.launches[0]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflowScript -> agent worker", quiet: true });
+		assert.deepEqual(h.launches[0]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflow -> agent worker", quiet: true });
 	});
 
 	it("rejects a non-boolean quiet value", async () => {
@@ -724,7 +1006,7 @@ describe("quiet schedules", () => {
 
 		const explicit = h.manager.handleToolCall({ action: "schedule.run", id: "quiet-hourly", quiet: true }, h.ctx);
 		await flush();
-		assert.deepEqual(h.launches[1]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflowScript -> agent worker", quiet: true });
+		assert.deepEqual(h.launches[1]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflow -> agent worker", quiet: true });
 		h.launches[1]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "manual-quiet" } });
 		await explicit;
 	});
@@ -737,7 +1019,7 @@ describe("recurring schedule execution", () => {
 		h.clock.now += 3_600_000;
 		h.timers.fireAll();
 		assert.equal(h.launches.length, 1);
-		assert.deepEqual(h.launches[0]?.params, { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Maintain backlog' })", args: {}, async: true, context: "fresh", cwd: h.ctx.cwd, mission: false, scheduleOrigin: { id: "hourly", name: "workflowScript -> agent worker" } });
+		assert.deepEqual(h.launches[0]?.params, { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Maintain backlog' })", args: {}, async: true, context: "fresh", cwd: h.ctx.cwd, mission: false, scheduleOrigin: { id: "hourly", name: "workflow -> agent worker" } });
 		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async worker" }], details: { mode: "single", results: [], asyncId: "async-1", asyncDir: "/tmp/async-1" } });
 		await flush();
 		assert.deepEqual([...h.manager.observedCompletionRunIds()], ["async-1"]);
@@ -1081,5 +1363,254 @@ describe("recurring schedule execution", () => {
 		const history = await h.manager.handleToolCall({ action: "schedule.history", id: "failures" }, h.ctx);
 		assert.match(text(history), /failed_run.*async async-fail/);
 		assert.match(text(history), /failed_launch/);
+	});
+});
+
+describe("active runs whose async runner died", () => {
+	const DEAD_PID = 4242;
+	const LIVE_PID = 4343;
+	const kill = (pid: number) => {
+		if (pid === LIVE_PID) return true;
+		throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+	};
+	const script = "return runs.run('main', { agent: 'monitor' })";
+
+	function scheduleDir(h: Harness, id: string): string {
+		return path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), id);
+	}
+
+	function events(h: Harness, id: string): Array<{ event: string; runId?: string }> {
+		return fs.readFileSync(path.join(scheduleDir(h, id), "events.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+	}
+
+	// The first fire attaches a running workflow whose status names the given runner PID.
+	async function attach(h: Harness, id: string, pid: number, create: Record<string, unknown> = { every: "1h" }): Promise<{ runId: string; asyncDir: string }> {
+		const created = await h.manager.handleToolCall({ action: "schedule.create", id, workflowScript: script, ...create }, h.ctx);
+		assert.equal(created.isError, undefined, text(created));
+		h.clock.now = nextRun(h, id);
+		h.timers.fireAll();
+		const asyncDir = path.join(h.root, `async-${id}`);
+		fs.mkdirSync(asyncDir);
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: `async-${id}`, mode: "workflow", state: "running", startedAt: h.clock.now, lastUpdate: h.clock.now, pid }), "utf-8");
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "workflow", results: [], asyncId: `async-${id}`, asyncDir } });
+		await flush();
+		const runId = JSON.parse(fs.readFileSync(path.join(scheduleDir(h, id), "schedule.json"), "utf-8")).activeRunId as string;
+		assert.ok(runId);
+		return { runId, asyncDir };
+	}
+
+	function nextRun(h: Harness, id: string): number {
+		return Date.parse(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, id), "schedule.json"), "utf-8")).trigger.nextRunAt);
+	}
+
+	function receipt(h: Harness, id: string, runId: string): Record<string, unknown> {
+		return JSON.parse(fs.readFileSync(path.join(scheduleDir(h, id), "runs", `${runId}.json`), "utf-8"));
+	}
+
+	it("fails a dead runner's run on the next fire and launches that fire instead of skipping it", async () => {
+		const h = harness({ kill });
+		const { runId, asyncDir } = await attach(h, "dead", DEAD_PID);
+		h.clock.now = nextRun(h, "dead");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 2, "the due fire launches a fresh run");
+		assert.equal(receipt(h, "dead", runId).state, "failed_run");
+		assert.match(String(receipt(h, "dead", runId).error), /Async runner process 4242 exited or disappeared/);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "failed");
+		const schedule = JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "dead"), "schedule.json"), "utf-8"));
+		assert.notEqual(schedule.activeRunId, runId);
+		assert.equal(fs.readFileSync(path.join(scheduleDir(h, "dead"), "active.lock"), "utf-8"), schedule.activeRunId);
+		assert.equal(schedule.trigger.nextRunAt, "2030-01-01T03:00:00.000Z", "the fire advances the interval once");
+		assert.deepEqual(events(h, "dead").filter((event) => event.event === "schedule.skipped_overlap"), []);
+		assert.equal(events(h, "dead").filter((event) => event.event === "schedule.run.started" && event.runId === schedule.activeRunId).length, 1);
+	});
+
+	it("releases a dead runner's claim when another session restores the schedule", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "restore", DEAD_PID);
+		h.manager.stop();
+		h.clock.now += 60_000;
+		const timers = new FakeTimers();
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+		});
+		next.bindSession(context(h.ctx.cwd, "session-b"));
+
+		assert.equal(receipt(h, "restore", runId).state, "failed_run");
+		assert.equal(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "restore"), "schedule.json"), "utf-8")).activeRunId, undefined);
+		assert.equal(fs.existsSync(path.join(scheduleDir(h, "restore"), "active.lock")), false);
+		assert.equal(timers.values.size, 1, "the released schedule is armed for its next fire");
+	});
+
+	it("keeps skipping while the runner is alive and its status is fresh", async () => {
+		const h = harness({ kill });
+		const { runId, asyncDir } = await attach(h, "live", LIVE_PID);
+		const lock = fs.readFileSync(path.join(scheduleDir(h, "live"), "active.lock"));
+		const status = fs.readFileSync(path.join(asyncDir, "status.json"));
+		h.clock.now = nextRun(h, "live");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 1);
+		assert.equal(receipt(h, "live", runId).state, "running");
+		assert.deepEqual(fs.readFileSync(path.join(scheduleDir(h, "live"), "active.lock")), lock);
+		assert.deepEqual(fs.readFileSync(path.join(asyncDir, "status.json")), status);
+		assert.equal(events(h, "live").filter((event) => event.event === "schedule.skipped_overlap").length, 1);
+	});
+
+	it("finds the active run by its receipt after it has left history", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "trimmed", DEAD_PID);
+		fs.writeFileSync(path.join(scheduleDir(h, "trimmed"), "history.json"), JSON.stringify({ schemaVersion: 1, runs: [] }), "utf-8");
+		h.clock.now = nextRun(h, "trimmed");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 2);
+		assert.equal(receipt(h, "trimmed", runId).state, "failed_run");
+	});
+
+	it("keeps a lock another session took after releasing the dead run", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "raced", DEAD_PID);
+		fs.writeFileSync(path.join(scheduleDir(h, "raced"), "active.lock"), "other-run", "utf-8");
+		h.clock.now = nextRun(h, "raced");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 1, "the other session's claim wins this fire");
+		assert.equal(receipt(h, "raced", runId).state, "failed_run");
+		assert.equal(fs.readFileSync(path.join(scheduleDir(h, "raced"), "active.lock"), "utf-8"), "other-run");
+	});
+
+	it("keeps an overdue occurrence when a restore releases a dead runner's claim", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "overdue", DEAD_PID, { every: "1h", catchUp: "latest" });
+		h.manager.stop();
+		h.clock.now = nextRun(h, "overdue") + 60_000;
+		const timers = new FakeTimers();
+		let launched = 0;
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: () => { launched++; return new Promise(() => {}); },
+		});
+		next.bindSession(context(h.ctx.cwd, "session-b"));
+
+		assert.equal(receipt(h, "overdue", runId).state, "failed_run");
+		assert.deepEqual(events(h, "overdue").filter((event) => event.event === "schedule.skipped_overlap"), []);
+		timers.fireAll();
+		await flush();
+		assert.equal(launched, 1, "the overdue occurrence fires after the restore");
+	});
+
+	it("arms a restored schedule when recording its released dead run fails", async () => {
+		const h = harness({ kill });
+		await attach(h, "locked", DEAD_PID);
+		h.manager.stop();
+		h.clock.now += 60_000;
+		// Another process holds the history.json lease, so recording the released run times out.
+		const lease = path.join(fs.realpathSync(scheduleDir(h, "locked")), "history.json.write-lock");
+		fs.mkdirSync(lease);
+		fs.writeFileSync(path.join(lease, "owner.json"), JSON.stringify({ token: "other-session", pid: process.pid, hostname: os.hostname() }));
+		const timers = new FakeTimers();
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: () => new Promise(() => {}),
+		});
+
+		assert.throws(() => next.bindSession(context(h.ctx.cwd, "session-b")), /Timed out waiting for another process/);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "locked"), "schedule.json"), "utf-8")).activeRunId, undefined);
+		assert.equal(timers.values.size, 1, "the released schedule is armed despite the failed history write");
+	});
+
+	it("arms a restored schedule from disk and keeps the error when releasing its dead run cannot write the schedule", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "full", DEAD_PID);
+		h.manager.stop();
+		h.clock.now += 60_000;
+		const scheduleFile = path.join(fs.realpathSync(scheduleDir(h, "full")), "schedule.json");
+		const originalRename = nodeFs.renameSync;
+		nodeFs.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+			if (path.join(fs.realpathSync(path.dirname(String(to))), path.basename(String(to))) === scheduleFile) throw Object.assign(new Error("schedule write ENOSPC"), { code: "ENOSPC" });
+			return originalRename(from, to);
+		}) as typeof fs.renameSync;
+		syncBuiltinESMExports();
+		const timers = new FakeTimers();
+		let launched = 0;
+		const next = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers,
+			kill,
+			launch: () => { launched++; return new Promise(() => {}); },
+		});
+		try {
+			assert.throws(() => next.bindSession(context(h.ctx.cwd, "session-b")), (error: NodeJS.ErrnoException) => error.code === "ENOSPC");
+		} finally {
+			nodeFs.renameSync = originalRename;
+			syncBuiltinESMExports();
+		}
+		assert.equal(JSON.parse(fs.readFileSync(scheduleFile, "utf-8")).activeRunId, runId);
+		assert.equal(timers.values.size, 1, "the still-claimed schedule is armed so its next fire retries the release");
+
+		h.clock.now = nextRun(h, "full");
+		timers.fireAll();
+		await flush();
+		assert.equal(receipt(h, "full", runId).state, "failed_run");
+		assert.equal(launched, 1);
+	});
+
+	it("leaves another session's newer claim alone when it released the dead run first", async () => {
+		let h: Harness;
+		const otherSessionClaims = (pid: number) => {
+			// Session A releases the dead run and claims this occurrence while this fire reconciles it.
+			const file = path.join(scheduleDir(h, "shared"), "schedule.json");
+			fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf-8")), activeRunId: "run-a" }), "utf-8");
+			fs.writeFileSync(path.join(scheduleDir(h, "shared"), "active.lock"), "run-a", "utf-8");
+			return kill(pid);
+		};
+		h = harness({ kill: otherSessionClaims });
+		const { runId } = await attach(h, "shared", DEAD_PID);
+		h.clock.now = nextRun(h, "shared");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 1, "this session launches nothing");
+		assert.equal(JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "shared"), "schedule.json"), "utf-8")).activeRunId, "run-a");
+		assert.equal(fs.readFileSync(path.join(scheduleDir(h, "shared"), "active.lock"), "utf-8"), "run-a");
+		assert.equal(receipt(h, "shared", runId).state, "running", "the session that released the run records its failure");
+		assert.equal(h.timers.values.size, 1, "the schedule stays armed");
+	});
+
+	it("advances a calendar schedule once when the recovered fire launches", async () => {
+		const h = harness({ kill });
+		const { runId } = await attach(h, "calendar", DEAD_PID, { every: "day", at: "09:00", timezone: "Asia/Taipei" });
+		assert.equal(new Date(h.clock.now).toISOString(), "2030-01-01T01:00:00.000Z");
+		h.clock.now = nextRun(h, "calendar");
+		h.timers.fireAll();
+		await flush();
+
+		assert.equal(h.launches.length, 2);
+		assert.equal(receipt(h, "calendar", runId).state, "failed_run");
+		const trigger = JSON.parse(fs.readFileSync(path.join(scheduleDir(h, "calendar"), "schedule.json"), "utf-8")).trigger;
+		assert.equal(trigger.nextLocalDate, "2030-01-03");
+		assert.equal(trigger.nextRunAt, "2030-01-03T01:00:00.000Z");
+		assert.equal(events(h, "calendar").filter((event) => event.event === "schedule.run.started").length, 2, "one started event per launched fire");
+		assert.deepEqual(events(h, "calendar").filter((event) => event.event === "schedule.skipped_overlap"), []);
 	});
 });

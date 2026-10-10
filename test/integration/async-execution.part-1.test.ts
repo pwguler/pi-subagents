@@ -519,6 +519,27 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(metadata.usage, expectedUsage);
 	});
 
+	it("records the parent session id in background run metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "linked output" });
+		const id = `async-parent-link-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Record the parent",
+			agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: path.join(tempDir, "parent.jsonl"), parentSessionId: "parent-session-id", parentSessionFile: path.join(tempDir, "parent.jsonl") },
+			artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 7 },
+			artifactsDir: path.join(tempDir, ".pi", "subagents", "artifacts"),
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		const payload = await readAsyncPayload(id);
+		const metadataPath = payload.results[0]?.artifactPaths?.metadataPath;
+		assert.ok(metadataPath);
+		assert.equal((JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as { parentSessionId?: string }).parentSessionId, "parent-session-id");
+	});
+
 	it("makes a launched async run immediately visible to exact status lookup", { skip: !isAsyncAvailable() || !resolveTargetedAsyncRun ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ delay: 500, output: "visible async done" });
 		const id = `async-initial-status-${Date.now().toString(36)}`;
@@ -609,6 +630,62 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
+	});
+
+	describe("with Pi's built-in MCP", () => {
+		const host = {
+			events: { emit() {} },
+			getCommands: () => [{ name: "mcp", sourceInfo: { path: "builtin:mcp" } }],
+			getAllTools: () => [["docs", "search"], ["docs", "fetch"], ["ext", "ping"]].map(([server, tool]) => ({ name: `mcp__${server}__${tool}`, exposure: "codemode", namespace: { name: `mcp__${server}` } })),
+			getMcpServers: () => [{ name: "ext" }],
+		};
+		const runForeground = (agent: ReturnType<typeof makeAgent>, projectTrusted?: boolean) => runSync(tempDir, [agent], agent.name, "Use MCP", { runtimeSnapshotHost: host, acceptance: false, projectTrusted });
+		const runBackground = async (agent: ReturnType<typeof makeAgent>) => {
+			const id = `async-builtin-mcp-${Date.now().toString(36)}`;
+			executeAsyncSingle(id, {
+				agent: agent.name, task: "Use MCP", agentConfig: agent,
+				ctx: { pi: host, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2, acceptance: false,
+			});
+			assert.equal((await readAsyncPayload(id)).success, true);
+			const callFile = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json")).sort().at(-1)!;
+			return (JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as MockPiCallRecord).launch!;
+		};
+
+		it("gives foreground and background children exactly the selected tools", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["docs/search"] });
+			mockPi.onCall({ output: "foreground done" });
+			assert.equal((await runForeground(agent)).exitCode, 0);
+			const foreground = mockPi.sessions.at(-1)!.launch;
+			assert.deepEqual(foreground.builtinMcpTools, [{ name: "mcp__docs__search", selector: "docs/search" }]);
+			assert.ok(foreground.tools?.includes("mcp__docs__search"));
+
+			mockPi.onCall({ output: "background done" });
+			const background = await runBackground(agent);
+			assert.deepEqual(background.builtinMcpTools, [{ name: "mcp__docs__search", selector: "docs/search" }]);
+			assert.ok(background.tools?.includes("mcp__docs__search"));
+			assert.equal(background.processEnv?.MCP_DIRECT_TOOLS, "__none__");
+		});
+
+		it("grants extension-registered servers only to background children", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["ext"] });
+			await assert.rejects(runForeground(agent), /extensions registered \(ext\)\. Only background children \(async: true\) load those extensions/);
+
+			mockPi.onCall({ output: "background done" });
+			const background = await runBackground(agent);
+			assert.deepEqual(background.builtinMcpTools, [{ name: "mcp__ext__ping", selector: "ext" }]);
+			assert.equal(background.ambientExtensions, true);
+		});
+
+		it("counts a project's .pi/mcp.json for foreground children only when the project is trusted", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const agent = makeAgent("worker", { tools: ["read"], mcpDirectTools: ["ext"] });
+			fs.mkdirSync(path.join(tempDir, ".pi"), { recursive: true });
+			fs.writeFileSync(path.join(tempDir, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { ext: { command: "ext-mcp" } } }));
+			await assert.rejects(runForeground(agent, false), /extensions registered \(ext\)/);
+			mockPi.onCall({ output: "foreground done" });
+			assert.equal((await runForeground(agent, true)).exitCode, 0);
+		});
 	});
 
 	it("matches preflight launch and definition digests for executor-launched async runs with the Intercom bridge active", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
@@ -990,6 +1067,78 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(outputPath?.startsWith(`${expectedDir}${path.sep}`));
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "async session artifact");
 		assert.equal(fs.existsSync(path.join(tempDir, ".pi/subagents", "artifacts")), false);
+	});
+
+	it("launches foreground and background children with the parent session's project trust", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const executor = makeAsyncExecutor([makeAgent("worker")]);
+		const ctx = { ...makeMinimalCtx(tempDir), isProjectTrusted: () => false };
+		mockPi.onCall({ output: "foreground done" });
+		const foreground = await executor.execute("trust-foreground", { agent: "worker", task: "Inspect", acceptance: false }, new AbortController().signal, undefined, ctx);
+		assert.equal(foreground.isError, undefined, foreground.content[0]?.text);
+		mockPi.onCall({ output: "background done" });
+		const background = await executor.execute("trust-background", { agent: "worker", task: "Inspect", async: true, acceptance: false }, new AbortController().signal, undefined, ctx) as AsyncExecutionResult;
+		await readAsyncPayload(background.details.asyncId!);
+		const trust = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")).launch.projectTrusted);
+		assert.deepEqual(trust, [false, false]);
+	});
+
+	it("resolves role models and model scope from user settings when the parent session declined project trust", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const home = path.join(tempDir, "trust-home");
+		const agentDir = path.join(home, ".pi", "agent");
+		const project = path.join(tempDir, "trust-project");
+		const writeJson = (filePath: string, value: unknown) => { fs.mkdirSync(path.dirname(filePath), { recursive: true }); fs.writeFileSync(filePath, JSON.stringify(value), "utf-8"); };
+		fs.mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+		fs.writeFileSync(path.join(agentDir, "agents", "trust-probe.md"), "---\nname: trust-probe\ndescription: Trust probe\n---\nUser body.\n", "utf-8");
+		writeJson(path.join(agentDir, "settings.json"), { subagents: { agentOverrides: { "trust-probe": { model: "openai/luna" } }, modelScope: { enforce: true, allow: ["openai/luna"] } } });
+		writeJson(path.join(project, ".pi", "settings.json"), { subagents: { agentOverrides: { "trust-probe": { model: "openai/astra" } }, modelScope: { enforce: true, allow: ["openai/astra"] } } });
+		const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
+		process.env.HOME = home;
+		process.env.USERPROFILE = home;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		try {
+			const executor = createSubagentExecutor!({
+				pi: { events: createEventBus(), getSessionName: () => undefined },
+				state: { baseCwd: project, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+				config: {},
+				asyncByDefault: false,
+				tempArtifactsDir: tempDir,
+				getSubagentSessionRoot: () => tempDir,
+				expandTilde: (p: string) => p,
+				discoverAgents: (cwd, scope, provider, options) => discoverAgents(cwd, scope, provider, { globalNpmRoot: null, ...options }),
+			});
+			const ctx = { ...makeMinimalCtx(project), isProjectTrusted: () => false };
+			const callFiles = () => fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"));
+			const before = new Set(callFiles());
+			mockPi.onCall({ output: "foreground done" });
+			const foreground = await executor.execute("untrusted-foreground", { agent: "trust-probe", task: "Inspect", acceptance: false }, new AbortController().signal, undefined, ctx);
+			assert.equal(foreground.isError, undefined, foreground.content[0]?.text);
+			mockPi.onCall({ output: "background done" });
+			const background = await executor.execute("untrusted-background", { agent: "trust-probe", task: "Inspect", async: true, acceptance: false }, new AbortController().signal, undefined, ctx) as AsyncExecutionResult;
+			assert.equal(background.isError, undefined, background.content[0]?.text);
+			await readAsyncPayload(background.details.asyncId!);
+			mockPi.onCall({ output: "workflow child done" });
+			const workflow = await executor.execute("untrusted-workflow", { workflowScript: `return await runs.run("child", { agent: "trust-probe", task: "Inspect" });`, async: false, mission: false }, new AbortController().signal, undefined, ctx);
+			assert.equal(workflow.isError, undefined, workflow.content[0]?.text);
+			const models = callFiles().filter((name) => !before.has(name))
+				.map((name) => JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")).launch.model);
+			assert.deepEqual(models, ["openai/luna", "openai/luna", "openai/luna"]);
+
+			for (const params of [
+				{ agent: "trust-probe", task: "Inspect", agentScope: "project" as const, acceptance: false },
+				{ action: "append-step", id: "untrusted-chain", agentScope: "project" as const, step: { agent: "trust-probe", task: "Inspect" } },
+			]) {
+				const projectScope = await executor.execute("untrusted-project-scope", params, new AbortController().signal, undefined, ctx);
+				assert.equal(projectScope.isError, true);
+				assert.match(projectScope.content[0]?.text ?? "", /agentScope: "project" requires project trust/);
+			}
+			assert.equal(callFiles().length, before.size + 3, "a rejected project-scope launch starts no child");
+		} finally {
+			for (const [name, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
 	});
 
 	it("persists async capability ceiling audit to status, results, events, and metadata", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

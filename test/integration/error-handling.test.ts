@@ -211,6 +211,56 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 
 		assert.equal(result.timedOut, true);
 		assert.match(result.error ?? "", /Tool 'bash' exceeded its timeout of 1000ms\./);
+		assert.match(result.finalOutput ?? "", /^Tool 'bash' exceeded its timeout of 1000ms\.\n\nRecovery summary:/);
+		assert.doesNotMatch(result.finalOutput ?? "", /Subagent timed out after/);
+	});
+
+	it("reports a foreground tool timeout without a run timeout as the tool timeout", { skip: process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash")] },
+				{ delay: 30_000 },
+			],
+		});
+		const agents = makeAgentConfigs(["slow"]);
+
+		const result = await runSync(tempDir, agents, "slow", "Wait", { toolTimeoutMs: 1_000 });
+
+		assert.equal(result.timedOut, true);
+		assert.equal(result.error, "Tool 'bash' exceeded its timeout of 1000ms.");
+		assert.match(result.finalOutput ?? "", /^Tool 'bash' exceeded its timeout of 1000ms\.\n\nRecovery summary:/);
+		assert.doesNotMatch(result.finalOutput ?? "", /timed out after 0ms/);
+	});
+
+	it("keeps the tool timeout as the cause when a child ignores abort past the run deadline", { timeout: 15_000 }, async () => {
+		let abortCalls = 0;
+		const factory = {
+			async create() {
+				let listener: (event: { type: string; [key: string]: unknown }) => void = () => {};
+				return {
+					subscribe(handler: typeof listener) { listener = handler; return () => {}; },
+					async prompt() {
+						listener({ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "sleep 100" } });
+						await new Promise(() => {});
+					},
+					async steer() {}, async followUp() {}, async dispose() {},
+					async abort() { abortCalls++; },
+					messages: [], sessionFile: undefined, sessionId: "ignores-abort", modelId: "mock/model",
+				};
+			},
+			async dispose() {},
+		};
+
+		const result = await runSync(tempDir, makeAgentConfigs(["slow"]), "slow", "Wait", {
+			toolTimeoutMs: 300,
+			timeoutMs: 800,
+			childSessionFactory: factory,
+		});
+
+		assert.equal(result.timedOut, true);
+		assert.equal(result.error, "Tool 'bash' exceeded its timeout of 300ms.");
+		assert.match(result.finalOutput ?? "", /^Tool 'bash' exceeded its timeout of 300ms\.\n\nRecovery summary:/);
+		assert.equal(abortCalls, 1);
 	});
 
 	it("emits foreground open-tool attention for an earlier overlapping tool", async () => {
@@ -242,6 +292,44 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 		assert.equal(attention?.type, "needs_attention");
 		assert.equal(attention?.currentTool, "bash");
 		assert.match(attention?.message ?? "", /tool 'bash' open/);
+	});
+
+	it("emits attention once per long-open foreground call after an earlier attention state", async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [{ type: "tool_execution_start", toolCallId: "first", toolName: "bash", args: { command: "sleep 2" } }] },
+			{ delay: 1600, jsonl: [{ type: "tool_execution_end", toolCallId: "first", toolName: "bash" }, events.toolResult("bash", "done")] },
+			{ jsonl: [{ type: "tool_execution_start", toolCallId: "second", toolName: "bash", args: { command: "sleep 2" } }] },
+			{ delay: 1600, jsonl: [{ type: "tool_execution_end", toolCallId: "second", toolName: "bash" }, events.toolResult("bash", "done"), events.assistantMessage("Done")] },
+		] });
+		const notices: Array<{ reason?: string; toolCallId?: string }> = [];
+		const result = await runSync(tempDir, makeAgentConfigs(["worker"]), "worker", "Run commands", {
+			runId: "foreground-sequential-attention",
+			controlConfig: { enabled: true, needsAttentionAfterMs: 999_999, activeNoticeAfterMs: 100, notifyOn: ["needs_attention"] },
+			onControlEvent: (event: { reason?: string; toolCallId?: string }) => notices.push(event),
+		});
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(notices.filter((event) => event.reason === "tool_open_threshold").map((event) => event.toolCallId), ["first", "second"]);
+	});
+
+	it("emits attention once for each overlapping long-open foreground call", async () => {
+		mockPi.onCall({ steps: [
+			{ jsonl: [{ type: "tool_execution_start", toolCallId: "first", toolName: "bash", args: { command: "sleep 3" } }] },
+			{ delay: 50, jsonl: [{ type: "tool_execution_start", toolCallId: "second", toolName: "bash", args: { command: "sleep 3" } }] },
+			{ delay: 2600, jsonl: [
+				{ type: "tool_execution_end", toolCallId: "first", toolName: "bash" },
+				{ type: "tool_execution_end", toolCallId: "second", toolName: "bash" },
+				events.toolResult("bash", "done"),
+				events.assistantMessage("Done"),
+			] },
+		] });
+		const notices: Array<{ reason?: string; toolCallId?: string }> = [];
+		const result = await runSync(tempDir, makeAgentConfigs(["worker"]), "worker", "Run commands", {
+			runId: "foreground-overlapping-attention",
+			controlConfig: { enabled: true, needsAttentionAfterMs: 999_999, activeNoticeAfterMs: 100, notifyOn: ["needs_attention"] },
+			onControlEvent: (event: { reason?: string; toolCallId?: string }) => notices.push(event),
+		});
+		assert.equal(result.exitCode, 0);
+		assert.deepEqual(notices.filter((event) => event.reason === "tool_open_threshold").map((event) => event.toolCallId), ["first", "second"]);
 	});
 
 	it("handles abort signal (completes faster than delay)", async () => {

@@ -4,13 +4,14 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { getArtifactsDir } from "../../src/shared/artifacts.ts";
-import { SUBAGENT_CHILD_STATUS_EVENT, SUBAGENT_CONTROL_EVENT, type ControlEvent } from "../../src/shared/types.ts";
+import { SUBAGENT_CHILD_STATUS_EVENT, SUBAGENT_CONTROL_EVENT, SUBAGENT_CONTROL_INTERCOM_EVENT, type ControlEvent } from "../../src/shared/types.ts";
 import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR } from "../../src/runs/shared/external-job-bridge.ts";
 import { createNativeSupervisorChannel, ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
+import { registerProgramStatusReporter } from "../../src/integrations/program-status.ts";
 import { createTempDir, removeTempDir, tryImport } from "../support/helpers.ts";
 
 interface AsyncJobTrackerModule {
@@ -29,6 +30,7 @@ interface AsyncJobTrackerModule {
 			kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 			now?: () => number;
 			supervisorRequestState?: (event: ControlEvent) => "pending" | "resolved" | "unknown";
+			onJobsChanged?: () => void;
 		},
 	): {
 		ensurePoller(): void;
@@ -169,6 +171,25 @@ function createNativeSupervisorHarness(sessionId: string) {
 	};
 	const channel = createNativeSupervisorChannel(pi as never, nativeState as never, { platform: "win32" });
 	return { channel, tools, sent };
+}
+
+/** Starts a run whose events.jsonl holds one native supervisor attention record. Requires mock timers. */
+function startSupervisorAttentionRun(asyncRoot: string, runId: string, timers: { tick(ms: number): void }) {
+	const runDir = path.join(asyncRoot, runId);
+	writeRunningAsyncStatus(runDir, runId, "session-grace");
+	fs.writeFileSync(path.join(runDir, "events.jsonl"), `${JSON.stringify({
+		type: "subagent.control",
+		channels: ["event", "intercom"],
+		event: supervisorControlEvent(runId, "call-grace"),
+		intercom: { to: "main", message: "SUBAGENT NEEDS ATTENTION: worker" },
+	})}\n`, "utf-8");
+	let answered = false;
+	const recorder = createEventRecorder();
+	const tracker = createTracker(recorder.pi, createState() as never, asyncRoot, { supervisorRequestState: () => answered ? "resolved" : "pending" });
+	tracker.handleStarted({ id: runId, asyncDir: runDir, agent: "worker", sessionId: "session-grace" });
+	timers.tick(25); // the tracker's event-refresh debounce
+	assert.deepEqual(recorder.events.map((entry) => [entry.channel, (entry.data as { noticeDeferred?: boolean }).noticeDeferred]), [[SUBAGENT_CONTROL_EVENT, true]], "status consumers see the request immediately, marked deferred");
+	return { tracker, answer: () => { answered = true; }, events: recorder.events };
 }
 
 function pidGone(): never {
@@ -372,6 +393,34 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(state.fleetJobs.get("run-1")?.status, "complete", "fleet history should outlive widget cleanup");
 			assert.ok(ui.renderRequests > 0, "expected widget cleanup to request a rerender");
 			assert.equal(ui.widgets.at(-1), undefined);
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("reports a tracked run to the terminal as working, then done, and keeps the done record after widget cleanup", async () => {
+		const asyncRoot = createTempDir("pi-async-job-program-status-");
+		try {
+			const state = createState();
+			const ui = createUiContext();
+			const writes: string[] = [];
+			const programStatus = registerProgramStatusReporter({
+				enabled: true,
+				getJobs: () => new Map([...state.fleetJobs, ...state.asyncJobs]).values(),
+				getPendingRequests: () => [],
+				write: (data) => writes.push(data),
+				isTTY: true,
+				env: { TERM: "xterm-256color" },
+			});
+			programStatus.sessionStarted({ hasUI: true, mode: "tui" });
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { completionRetentionMs: 5, onJobsChanged: programStatus.sync });
+			tracker.resetJobs(ui.ctx as never);
+			tracker.handleStarted({ id: "run-osc", asyncDir: path.join(asyncRoot, "run-osc"), agent: "worker" });
+			tracker.handleComplete({ id: "run-osc", success: true });
+			await waitForCondition(() => state.asyncJobs.size === 0, "widget cleanup", 1000);
+
+			const states = writes.map((report) => /state=(\w+):id=([^:]+)/.exec(report)?.slice(1).join(" "));
+			assert.deepEqual(states, ["working subagents/runosc", "done subagents/runosc"]);
 		} finally {
 			removeTempDir(asyncRoot);
 		}
@@ -1714,6 +1763,47 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		} finally {
 			channel.dispose();
 			fs.rmSync(channelDir, { recursive: true, force: true });
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("sends no parent notice for a supervisor request answered within the grace period", (t) => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-grace-answered-");
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		try {
+			const run = startSupervisorAttentionRun(asyncRoot, "run-grace-answered", t.mock.timers);
+			run.answer();
+			t.mock.timers.tick(60_000);
+			assert.equal(run.events.length, 1);
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("escalates a supervisor request still unanswered after the grace period once", (t) => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-grace-pending-");
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		try {
+			const run = startSupervisorAttentionRun(asyncRoot, "run-grace-pending", t.mock.timers);
+			t.mock.timers.tick(59_000);
+			assert.equal(run.events.length, 1);
+			t.mock.timers.tick(1_000);
+			t.mock.timers.tick(120_000);
+			assert.deepEqual(run.events.slice(1).map((entry) => [entry.channel, (entry.data as { noticeDeferred?: boolean }).noticeDeferred]), [[SUBAGENT_CONTROL_EVENT, undefined], [SUBAGENT_CONTROL_INTERCOM_EVENT, undefined]]);
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("drops a pending supervisor notice when the run finishes during the grace period", (t) => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-grace-finished-");
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		try {
+			const run = startSupervisorAttentionRun(asyncRoot, "run-grace-finished", t.mock.timers);
+			run.tracker.handleComplete({ id: "run-grace-finished", success: true });
+			t.mock.timers.tick(60_000);
+			assert.equal(run.events.filter((entry) => entry.channel === SUBAGENT_CONTROL_EVENT || entry.channel === SUBAGENT_CONTROL_INTERCOM_EVENT).length, 1);
+		} finally {
 			removeTempDir(asyncRoot);
 		}
 	});

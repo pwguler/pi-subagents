@@ -887,7 +887,18 @@ const AST_SCALAR_KEYS = new Set(["type", "start", "end"]);
 
 function assertPortableWorkflowScript(source) {
   const wrapped = "(async () => {\n" + source + "\n})()";
-  const ast = parse(wrapped, { ecmaVersion: "latest", sourceType: "script" });
+  let ast;
+  try {
+    ast = parse(wrapped, { ecmaVersion: "latest", sourceType: "script" });
+  } catch (error) {
+    // The wrapper adds one line before the script; report the script's own line.
+    if (isSyntaxError(error) && typeof error.message === "string") {
+      const message = error.message.replace(/\((\d+):(\d+)\)$/, (_match, line, column) => "(" + Math.max(1, Number(line) - 1) + ":" + column + ")");
+      if (typeof error.stack === "string") error.stack = error.stack.replace(error.message, message);
+      error.message = message;
+    }
+    throw error;
+  }
   const wrapper = workflowWrapperFunction(ast);
   walkWorkflowAst(wrapper.body, wrapper);
 }
@@ -1005,7 +1016,7 @@ parentPort.on("message", async (message) => {
   }
   if (message.type !== "start") return;
   try {
-    const sandbox = { runs, Promise: workflowPromise, emit(value) { const emittedValue = unwrapRunsAllResults(value); assertJsonValue(emittedValue); parentPort.postMessage({ type: "emit", value: emittedValue }); }, console: capturedConsole };
+    const sandbox = { runs, Promise: workflowPromise, emit(value) { const unwrapped = unwrapRunsAllResults(value); const emittedValue = unwrapped === undefined ? null : omitUndefinedWorkflowValues(unwrapped); assertJsonValue(emittedValue); parentPort.postMessage({ type: "emit", value: emittedValue }); }, console: capturedConsole };
     if (message.stateEnabled) sandbox.state = state;
     const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
@@ -1015,7 +1026,7 @@ parentPort.on("message", async (message) => {
     let compiled;
     try {
       assertPortableWorkflowScript(message.script);
-      compiled = new vm.Script("(async () => {\n" + message.script + "\n})()", { filename: "workflow-script.js" });
+      compiled = new vm.Script("(async () => {\n" + message.script + "\n})()", { filename: "workflow-script.js", lineOffset: -1 });
     } catch (error) {
       parentPort.postMessage({ type: "error", errorKind: "validation", error: isSyntaxError(error) ? formatWorkflowScriptSyntaxError(error) : formatWorkflowScriptError(error) });
       return;
@@ -1027,7 +1038,9 @@ parentPort.on("message", async (message) => {
     let stopWorkflowPromiseHook;
     let value;
     try {
-      Object.defineProperty(nativePromisePrototype, "then", {
+      // Some hosts freeze built-ins in every realm, which makes then read-only. The promise hooks
+      // below still track observation, so skip the wrapper rather than fail every workflow.
+      if (nativeThenDescriptor.configurable) Object.defineProperty(nativePromisePrototype, "then", {
         ...nativeThenDescriptor,
         value: function workflowPromiseThen(...args) {
           if (isDirectWorkflowScriptPromiseHandlerCall() || suppressNativePromiseConsumption > 0) {
@@ -1067,7 +1080,7 @@ parentPort.on("message", async (message) => {
         stopWorkflowPromiseHook?.();
       } finally {
         try {
-          Object.defineProperty(nativePromisePrototype, "then", nativeThenDescriptor);
+          if (nativeThenDescriptor.configurable) Object.defineProperty(nativePromisePrototype, "then", nativeThenDescriptor);
         } finally {
           topLevelWorkflowPromise = undefined;
           activeNativePromises.length = 0;
@@ -1121,6 +1134,8 @@ export interface WorkflowScriptChildResult {
 	continuation?: { runIds: string[] };
 	artifactPaths: string[];
 	results?: SingleResult[];
+	/** Came from a runtime-replaced run of the same script and args (its saved result, or its still-running child re-attached); this run launched nothing. */
+	reused?: boolean;
 }
 
 export interface WorkflowScriptTraceEntry {
@@ -1138,6 +1153,8 @@ export interface WorkflowScriptTraceEntry {
 	generatedLaneKey?: string;
 	lane?: import("../shared/types.ts").WorkflowLaneMetadata;
 	warning?: string;
+	/** The settled result came from a previous run of the same script and args; no child was launched. */
+	reused?: boolean;
 }
 
 /** Bounded plan metadata emitted when a workflow materializes a runs.lanes graph. */
@@ -1220,6 +1237,8 @@ export interface WorkflowChildSettledNotification {
 	outputReference?: string;
 	error?: string;
 	workflowRunning: boolean;
+	/** The script-visible result, exactly as returned to the script. */
+	result: WorkflowScriptChildResult;
 }
 
 export interface RunWorkflowScriptOptions {
@@ -1526,6 +1545,11 @@ function canonicalRunParams(params: Record<string, unknown>): Record<string, unk
 	if (params.gate === undefined || params.acceptance !== false) return params;
 	const { acceptance: _acceptance, ...withoutAcceptance } = params;
 	return withoutAcceptance;
+}
+
+/** Canonical launch-params identity; matches the worker's stableRunJson(canonicalRunParams(params)). */
+export function workflowRunParamsFingerprint(params: Record<string, unknown>): string {
+	return stableJson(canonicalRunParams(params));
 }
 
 function validateKey(value: unknown, owner = "runs.run"): string {
@@ -1956,7 +1980,8 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 				? node.arguments[1]
 				: undefined;
 		if (boundaryValue) {
-			const message = definitelyNonJson(boundaryValue);
+			// emit normalizes undefined like return; state.set values must already be JSON.
+			const message = definitelyNonJson(boundaryValue, Array.isArray(node.arguments) && boundaryValue === node.arguments[0]);
 			if (message) errors.push({ message: `workflowScript boundary value is invalid: ${message}.`, ...nodeLocation(boundaryValue) });
 		}
 	});
@@ -2223,6 +2248,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				...(outputReference ? { outputReference } : {}),
 				...(!result.ok && result.error ? { error: result.error } : {}),
 				workflowRunning: !settled && !finishing,
+				result,
 			});
 		} catch (error) {
 			console.error("Workflow onChildSettled callback failed:", error);
@@ -2545,7 +2571,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					}
 					return result;
 				});
-			const fingerprint = stableJson(canonicalRunParams(params));
+			const fingerprint = workflowRunParamsFingerprint(params);
 			const existing = launches.get(key);
 			if (existing) {
 				if (existing.fingerprint !== fingerprint) return respond(Promise.reject(new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`)));
@@ -2678,7 +2704,9 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				children.set(key, normalized);
 				recordAcceptanceRecoveryBarrier(key, normalized);
 				const state = normalized.state === "running" ? "started" : normalized.ok ? "completed" : normalized.stopped ? "stopped" : normalized.detached ? "detached" : "failed";
-				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok && normalized.state !== "running" ? { error: normalized.error ?? normalized.output } : {}) });
+				const settledEntry: WorkflowScriptTraceEntry = { operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok && normalized.state !== "running" ? { error: normalized.error ?? normalized.output } : {}) };
+				if (normalized.reused) settledEntry.reused = true;
+				trace.push(settledEntry);
 				traceChanged();
 				notifyChildSettled(key, normalized);
 				return normalized;

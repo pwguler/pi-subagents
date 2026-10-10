@@ -229,4 +229,79 @@ describe("agent discovery snapshots", () => {
 		assert.equal(discoverAgents(project, "both").agents.some((agent) => agent.name === "worker"), true);
 		assert.equal(discoverAgentsAll(project).chainDiagnostics.some((diagnostic) => diagnostic.filePath === chainPath), true);
 	});
+
+	it("ignores project settings, agents and chains when the session declined project trust", () => {
+		writeAgent(path.join(home, ".pi", "agent", "agents", "probe.md"), "probe", "User probe");
+		writeJson(path.join(home, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { probe: { model: "openai/luna" } }, modelScope: { enforce: true, allow: ["openai/luna"] } },
+		});
+		writeAgent(path.join(project, ".pi", "agents", "project-only.md"), "project-only", "Project only");
+		writeJson(path.join(project, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { probe: { model: "openai/astra" } }, modelScope: { enforce: true, allow: ["openai/astra"] } },
+		});
+		fs.mkdirSync(path.join(project, ".pi", "chains"), { recursive: true });
+		fs.writeFileSync(path.join(project, ".pi", "chains", "project.chain.md"), "---\nname: project-chain\ndescription: Project chain\n---\n\n## probe\nInspect\n", "utf-8");
+		// The repository's own package.json can declare agents too.
+		writeJson(path.join(project, "package.json"), { name: "repo", "pi-subagents": { agents: ["./repo-agents"] } });
+		writeAgent(path.join(project, "repo-agents", "repo-agent.md"), "repo-agent", "Repository agent");
+
+		const untrusted = { projectTrusted: false };
+		for (const discovered of [discoverAgents(project, "both", undefined, untrusted), discoverAgentSnapshot(project, "both", undefined, untrusted).effective]) {
+			assert.equal(discovered.agents.find((agent) => agent.name === "probe")?.model, "openai/luna");
+			assert.equal(discovered.agents.some((agent) => agent.name === "project-only"), false);
+			assert.equal(discovered.agents.some((agent) => agent.name === "repo-agent"), false);
+			assert.deepEqual(discovered.modelScope?.allow, ["openai/luna"]);
+			assert.equal(discovered.directories.some((directory) => directory.source === "project" || directory.source === "package"), false);
+		}
+		const all = discoverAgentsAll(project, undefined, untrusted);
+		assert.deepEqual(all.project, []);
+		assert.deepEqual(all.package, []);
+		assert.equal(all.user.find((agent) => agent.name === "probe")?.model, "openai/luna");
+		assert.equal(all.chains.some((chain) => chain.name === "project-chain"), false);
+		assert.throws(() => discoverAgents(project, "project", undefined, untrusted), /agentScope: "project" requires project trust/);
+		assert.throws(() => discoverAgentSnapshot(project, "project", undefined, untrusted), /agentScope: "project" requires project trust/);
+		assert.equal(discoverAgents(project, "user", undefined, untrusted).agents.some((agent) => agent.name === "repo-agent"), false);
+
+		// Trusted lookups share the cached sources and still see the project.
+		const trusted = discoverAgentSnapshot(project, "both");
+		assert.equal(trusted.effective.agents.find((agent) => agent.name === "probe")?.model, "openai/astra");
+		assert.equal(trusted.effective.agents.some((agent) => agent.name === "project-only"), true);
+		assert.equal(trusted.effective.agents.some((agent) => agent.name === "repo-agent"), true);
+		assert.equal(discoverAgents(project, "user").agents.some((agent) => agent.name === "repo-agent"), true);
+		assert.deepEqual(trusted.effective.modelScope?.allow, ["openai/astra"]);
+		assert.equal(trusted.all.chains.some((chain) => chain.name === "project-chain"), true);
+		assert.equal(discoverAgents(project, "both", undefined, untrusted).agents.find((agent) => agent.name === "probe")?.model, "openai/luna");
+	});
+
+	it("reads nothing from project settings when the session declined project trust", () => {
+		const userAgents = path.join(home, ".pi", "agent", "agents");
+		writeAgent(path.join(userAgents, "probe.md"), "probe", "User probe");
+		writeJson(path.join(home, ".pi", "agent", "settings.json"), { subagents: { agentOverrides: { probe: { model: "openai/luna" } } } });
+		const projectSettings = path.join(project, ".pi", "settings.json");
+		const untrusted = { projectTrusted: false };
+
+		for (const content of ["{ not json", JSON.stringify({ subagents: { projectRootResolution: "bogus" } })]) {
+			fs.mkdirSync(path.dirname(projectSettings), { recursive: true });
+			fs.writeFileSync(projectSettings, content, "utf-8");
+			clearAgentDiscoveryCache();
+			assert.throws(() => discoverAgents(project, "both"), /settings/u, "a trusted lookup still reports the broken file");
+			assert.equal(discoverAgents(project, "both", undefined, untrusted).agents.find((agent) => agent.name === "probe")?.model, "openai/luna");
+			assert.equal(discoverAgentSnapshot(project, "both", undefined, untrusted).effective.agents.some((agent) => agent.name === "probe"), true);
+			// Runtime-registered agents take their model settings from the same untrusted view.
+			const registration = registerAgent({ pi, name: "runtime-probe", definition: { description: "Runtime probe", systemPrompt: "Runtime." } });
+			try {
+				const snapshot = discoverAgentSnapshot(project, "both", undefined, { includeChains: false, projectTrusted: false });
+				const merged = mergeRuntimeAgents(pi, snapshot.effective, snapshot.effective.agents, { cwd: project, scope: snapshot.effective.scope, projectTrusted: false });
+				assert.equal(merged.agents.some((agent) => agent.name === "runtime-probe"), true);
+			} finally {
+				registration.dispose();
+			}
+		}
+
+		// A project's agentExcludeDirs cannot hide user agents either.
+		writeJson(projectSettings, { subagents: { agentExcludeDirs: [userAgents] } });
+		assert.equal(discoverAgents(project, "both").agents.some((agent) => agent.name === "probe"), false);
+		assert.equal(discoverAgents(project, "both", undefined, untrusted).agents.some((agent) => agent.name === "probe"), true);
+		assert.equal(discoverAgents(project, "both").agents.some((agent) => agent.name === "probe"), false);
+	});
 });

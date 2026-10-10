@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEvent, BeforeProviderRequestEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { permissionDecision } from "./permissions.ts";
 import type { SteerRequest } from "../background/control-channel.ts";
@@ -22,6 +22,7 @@ import { captureWatchdogDiffBaseline, createWatchdogDiffTool, WATCHDOG_DIFF_TOOL
 import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
+import { MODEL_ONLY_TOOL } from "../../shared/extension-context.ts";
 import {
 	childSupervisorMetadata,
 	evaluateChildToolDiagnostic,
@@ -197,16 +198,16 @@ export function stripSubagentOrchestrationSkill(prompt: string): string {
 
 function stripChildBoundaryInstructions(prompt: string): string {
 	let rewritten = prompt;
-	for (const boundary of [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS]) {
-		rewritten = rewritten.split(boundary).join("");
+	for (const instructions of [CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS, CHILD_FANOUT_BOUNDARY_INSTRUCTIONS, STRUCTURED_OUTPUT_INSTRUCTIONS]) {
+		rewritten = rewritten.split(`\n\n${instructions}`).join("").split(instructions).join("");
 	}
 	return rewritten.replace(/^(?:[ \t]*\r?\n)+/, "");
 }
 
-export function rewriteSubagentPrompt(
-	prompt: string,
-	options: { inheritProjectContext: boolean; inheritGlobalContext: boolean; inheritSkills: boolean; fanoutChild?: boolean; structuredOutput?: boolean },
-): string {
+type InheritedPromptOptions = { inheritProjectContext: boolean; inheritGlobalContext: boolean; inheritSkills: boolean };
+type ChildBoundaryOptions = { fanoutChild?: boolean; structuredOutput?: boolean };
+
+function stripInheritedPromptText(prompt: string, options: InheritedPromptOptions): string {
 	let rewritten = prompt;
 	if (!options.inheritProjectContext) {
 		rewritten = stripProjectContext(rewritten);
@@ -217,11 +218,41 @@ export function rewriteSubagentPrompt(
 	if (!options.inheritSkills) {
 		rewritten = stripInheritedSkills(rewritten);
 	}
-	rewritten = stripSubagentOrchestrationSkill(rewritten);
-	rewritten = stripChildBoundaryInstructions(rewritten);
+	return stripChildBoundaryInstructions(stripSubagentOrchestrationSkill(rewritten));
+}
+
+function appendChildBoundary(prompt: string, options: ChildBoundaryOptions): string {
 	const boundary = options.fanoutChild ? CHILD_FANOUT_BOUNDARY_INSTRUCTIONS : CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS;
 	const structured = options.structuredOutput ? `\n\n${STRUCTURED_OUTPUT_INSTRUCTIONS}` : "";
-	return `${boundary}${structured}\n\n${rewritten}`;
+	// Pi's base prompt stays first so providers that recognize it by its opening still do.
+	return `${stripChildBoundaryInstructions(prompt)}\n\n${boundary}${structured}`;
+}
+
+export function rewriteSubagentPrompt(prompt: string, options: InheritedPromptOptions & ChildBoundaryOptions): string {
+	return appendChildBoundary(stripInheritedPromptText(prompt, options), options);
+}
+
+/** In place, so later handlers and the final render never see the removed context. */
+function filterChildPromptOptions(options: BeforeAgentStartEvent["systemPromptOptions"], inherited: InheritedPromptOptions): void {
+	if (!inherited.inheritProjectContext) options.contextFiles = [];
+	else if (!inherited.inheritGlobalContext) options.contextFiles = options.contextFiles.filter((file) => !isGlobalContextFile(file.path));
+	options.skills = inherited.inheritSkills ? options.skills.filter((skill) => skill.name !== "pi-subagents") : [];
+	// Role prompts can embed context, skill catalogs, or an earlier child's boundary as text.
+	if (options.customPrompt) options.customPrompt = stripInheritedPromptText(options.customPrompt, inherited);
+	if (options.appendSystemPrompt) options.appendSystemPrompt = stripInheritedPromptText(options.appendSystemPrompt, inherited);
+}
+
+function rewritesChildPrompt(config: ChildRuntimeConfig): boolean {
+	return config.inheritProjectContext !== undefined || config.inheritGlobalContext !== undefined || config.inheritSkills !== undefined || Boolean(config.fanoutChild);
+}
+
+/** Installed after every other extension: a returned prompt freezes out sections added after it. */
+export function registerSubagentPromptBoundary(pi: ExtensionAPI, config: ChildRuntimeConfig): void {
+	if (!rewritesChildPrompt(config)) return;
+	pi.on("before_agent_start", (event) => {
+		const finalized = appendChildBoundary(event.systemPrompt, { fanoutChild: config.fanoutChild, structuredOutput: Boolean(config.structuredOutput) });
+		return finalized === event.systemPrompt ? undefined : { systemPrompt: finalized };
+	});
 }
 
 function isParentOnlySubagentMessage(message: unknown): boolean {
@@ -266,17 +297,22 @@ export function rewriteForkCacheProviderRequest(event: BeforeProviderRequestEven
 	return { ...payload, prompt_cache_key: key };
 }
 
-function portableToolId(id: string): string {
+function portableToolId(id: string, preserveBoundedCompositeToolIds = false): string {
 	if (PORTABLE_TOOL_ID_PATTERN.test(id) && id.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return id;
+	// Codex splits call_id|item_id on replay; each wire ID must remain portable and bounded.
+	if (preserveBoundedCompositeToolIds) {
+		const parts = id.split("|");
+		if (parts.length === 2 && parts.every((part) => PORTABLE_TOOL_ID_PATTERN.test(part) && part.length <= MAX_PORTABLE_TOOL_ID_LENGTH)) return id;
+	}
 	const encoded = `tool_${Buffer.from(id).toString("base64url") || "empty"}`;
 	if (encoded.length <= MAX_PORTABLE_TOOL_ID_LENGTH) return encoded;
 	return `tool_${createHash("sha256").update(id).digest("base64url")}`;
 }
 
-function sanitizeToolHistoryMessage(message: unknown): unknown {
+function sanitizeToolHistoryMessage(message: unknown, preserveBoundedCompositeToolIds = false): unknown {
 	const m = message as { role?: string; content?: unknown; toolCallId?: unknown };
 	if (m?.role === "toolResult" && typeof m.toolCallId === "string") {
-		const toolCallId = portableToolId(m.toolCallId);
+		const toolCallId = portableToolId(m.toolCallId, preserveBoundedCompositeToolIds);
 		return toolCallId === m.toolCallId ? message : { ...m, toolCallId };
 	}
 	if (m?.role !== "assistant" || !Array.isArray(m.content)) return message;
@@ -284,7 +320,7 @@ function sanitizeToolHistoryMessage(message: unknown): unknown {
 	const content = m.content.map((block) => {
 		const b = block as { type?: string; id?: unknown };
 		if (b?.type !== "toolCall" || typeof b.id !== "string") return block;
-		const id = portableToolId(b.id);
+		const id = portableToolId(b.id, preserveBoundedCompositeToolIds);
 		if (id === b.id) return block;
 		changed = true;
 		return { ...b, id };
@@ -301,7 +337,7 @@ function stripAssistantSubagentToolCallBlocks(message: unknown): unknown | undef
 	return { ...m, content: filteredContent };
 }
 
-export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveFanoutToolHistory?: boolean } = {}): unknown[] {
+export function stripParentOnlySubagentMessages(messages: unknown[], options: { sanitizeToolIds?: boolean; preserveBoundedCompositeToolIds?: boolean; preserveFanoutToolHistory?: boolean } = {}): unknown[] {
 	const preserveCurrentFanoutToolHistory = options.preserveFanoutToolHistory === true;
 	const sanitizeToolIds = options.sanitizeToolIds ?? true;
 	let changed = false;
@@ -316,7 +352,7 @@ export function stripParentOnlySubagentMessages(messages: unknown[], options: { 
 			changed = true;
 			continue;
 		}
-		const sanitized = sanitizeToolIds ? sanitizeToolHistoryMessage(stripped) : stripped;
+		const sanitized = sanitizeToolIds ? sanitizeToolHistoryMessage(stripped, options.preserveBoundedCompositeToolIds === true) : stripped;
 		if (stripped !== message || sanitized !== stripped) changed = true;
 		filtered.push(sanitized);
 	}
@@ -417,6 +453,7 @@ function registerStructuredOutputTool(pi: ExtensionAPI, structured: NonNullable<
 	}) => void;
 	registerTool({
 		name: "structured_output",
+		...MODEL_ONLY_TOOL,
 		label: "Structured Output",
 		description: "Submit the required final structured output for this subagent step. This terminates the step.",
 		parameters,
@@ -522,6 +559,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 		if (!event || typeof event !== "object" || !("messages" in event) || !Array.isArray(event.messages)) return undefined;
 		const messages = stripParentOnlySubagentMessages(event.messages, {
 			sanitizeToolIds: !COMPOSITE_TOOL_ID_APIS.has(ctx?.model?.api ?? ""),
+			preserveBoundedCompositeToolIds: ctx?.model?.api === "openai-codex-responses",
 			preserveFanoutToolHistory: config.fanoutChild,
 		});
 		if (messages === event.messages) return undefined;
@@ -549,19 +587,12 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 			pi.setSessionName(childSessionName);
 		}
 
-		const { inheritProjectContext, inheritGlobalContext, inheritSkills } = config;
-		const fanoutChild = config.fanoutChild;
-		let rewritten = event.systemPrompt;
-		if (inheritProjectContext !== undefined || inheritGlobalContext !== undefined || inheritSkills !== undefined || fanoutChild) {
-			rewritten = rewriteSubagentPrompt(event.systemPrompt, {
-				inheritProjectContext: inheritProjectContext ?? true,
-				inheritGlobalContext: inheritGlobalContext ?? true,
-				inheritSkills: inheritSkills ?? true,
-				fanoutChild,
-				structuredOutput: Boolean(config.structuredOutput),
-			});
-		}
-		if (rewritten === event.systemPrompt) return;
-		return { systemPrompt: rewritten };
+		// Filter the inputs instead of returning a prompt; the boundary hook appends the boundary last.
+		if (!rewritesChildPrompt(config)) return;
+		filterChildPromptOptions((event as BeforeAgentStartEvent).systemPromptOptions, {
+			inheritProjectContext: config.inheritProjectContext ?? true,
+			inheritGlobalContext: config.inheritGlobalContext ?? true,
+			inheritSkills: config.inheritSkills ?? true,
+		});
 	});
 }

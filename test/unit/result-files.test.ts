@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
-import { cleanupResultIndexes, removeResultIndex, resultCandidateFilesForSession, resultFilesForSession, resultFilesForToolCall, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, writeAsyncResultFile, writePendingAsyncResultFile, writeResultIndexForData } from "../../src/runs/background/result-files.ts";
+import { acknowledgeMissionObserverSnapshot, cleanupResultIndexes, removeResultIndex, resultCandidateFilesForSession, resultFilesForSession, resultFilesForToolCall, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, retireResultSnapshot, withResultRunLease, writeAsyncResultFile, writePendingAsyncResultFile, writeResultIndexForData } from "../../src/runs/background/result-files.ts";
 
 const JSON_EXTENSION = ".json";
 const MAX_JSON_FILE_STEM_BYTES = MAX_INDEX_SEGMENT_BYTES - Buffer.byteLength(JSON_EXTENSION, "utf-8");
@@ -269,6 +269,91 @@ describe("result file indexes", () => {
 		}
 	});
 
+	it("leaves nothing behind once a consumer has taken the payload, wherever the writer is interrupted", (t) => {
+		// Renames are the only writer steps readers can see. A consumer starts polling at each
+		// one in turn; from the moment its cleanup returns, nothing may reappear.
+		for (let startAt = 0, points = Infinity; startAt <= points; startAt++) {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-consumed-"));
+			const resultPath = path.join(resultsDir, "workflow-result.json");
+			const originalRenameSync = fsDefault.renameSync;
+			let point = 0;
+			let consumed = false;
+			let inConsumer = false;
+			const consumerStep = (): void => {
+				if (consumed) {
+					const retained = fs.readdirSync(path.join(resultsDir, "result-index"), { recursive: true }).filter((entry) => String(entry).endsWith(".json"));
+					assert.deepEqual(retained, [], `consumer started at point ${startAt}, checked at point ${point}`);
+					assert.equal(fs.existsSync(resultPath), false);
+					return;
+				}
+				inConsumer = true;
+				try {
+					if (!resultPayloadPathForSessionRun(resultsDir, "session-a", "consumed")) return;
+					fs.rmSync(resultPath, { force: true });
+					removeResultIndex(resultsDir, "session-a", "consumed", "call-a");
+					consumed = true;
+				} finally {
+					inConsumer = false;
+				}
+			};
+			try {
+				fs.writeFileSync(path.join(resultsDir, "mission.json"), "{}", "utf-8");
+				t.mock.method(fsDefault, "renameSync", (source: fs.PathLike, target: fs.PathLike) => {
+					if (inConsumer) return originalRenameSync(source, target);
+					if (point++ >= startAt) consumerStep();
+					originalRenameSync(source, target);
+					if (point++ >= startAt) consumerStep();
+				});
+				syncBuiltinESMExports();
+				writeAsyncResultFile(resultPath, { id: "consumed", runId: "consumed", sessionId: "session-a", toolCallId: "call-a", asyncDir: resultsDir, success: true });
+				points = point;
+				consumerStep();
+				consumerStep();
+				assert.equal(consumed, true);
+			} finally {
+				t.mock.restoreAll();
+				syncBuiltinESMExports();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("keeps a pending-only result findable by run id when looked up while it is being written", (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-lookup-during-write-"));
+		const originalRenameSync = fsDefault.renameSync;
+		const originalError = console.error;
+		let inLookup = false;
+		const lookup = (): void => {
+			inLookup = true;
+			try {
+				resultPayloadPathForIndexedRun(resultsDir, "paused");
+			} finally {
+				inLookup = false;
+			}
+		};
+		try {
+			console.error = () => {};
+			const resultPath = path.join(resultsDir, "paused.json");
+			fs.mkdirSync(resultPath);
+			t.mock.method(fsDefault, "renameSync", (source: fs.PathLike, target: fs.PathLike) => {
+				if (inLookup) return originalRenameSync(source, target);
+				lookup();
+				originalRenameSync(source, target);
+				lookup();
+			});
+			syncBuiltinESMExports();
+			writePendingAsyncResultFile(resultPath, { id: "paused", runId: "paused", sessionId: "session-a", success: false });
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			assert.equal(resultPayloadPathForIndexedRun(resultsDir, "paused"), pendingPath(resultsDir, "session-a", "paused"));
+		} finally {
+			console.error = originalError;
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("indexes results with oversized provider tool-call ids", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-long-tool-call-"));
 		try {
@@ -496,6 +581,205 @@ describe("result file indexes", () => {
 			fsDefault.readdirSync = originalReaddirSync;
 			syncBuiltinESMExports();
 			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("a run's paused result replaced by its final result", () => {
+	const runId = "replaced-run";
+	const sessionId = "session-a";
+	// The runner's paused result has no tool-call id and its final result adds one; state and timestamp can match.
+	const paused = (asyncDir: string) => ({ id: runId, runId, sessionId, asyncDir, state: "paused", timestamp: 1_000, summary: "Paused." });
+	const final = (asyncDir: string) => ({ id: runId, toolCallId: "call-a", sessionId, asyncDir, state: "paused", timestamp: 1_000, summary: "Paused after interrupt. Waiting for explicit next action." });
+	const publishPaused = (publicPath: string): void => withResultRunLease(path.dirname(publicPath), runId, () => writePendingAsyncResultFile(publicPath, paused(path.dirname(publicPath))));
+	const publishFinal = (publicPath: string): void => withResultRunLease(path.dirname(publicPath), runId, () => { writeAsyncResultFile(publicPath, final(path.dirname(publicPath))); });
+	const fixture = (fileName = `${runId}.json`) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-replaced-"));
+		fs.writeFileSync(path.join(dir, "mission.json"), "{}", "utf-8");
+		return { dir, publicPath: path.join(dir, fileName) };
+	};
+	const readPublic = (publicPath: string, toolCallId?: string) => ({ runId, sessionId, ...(toolCallId ? { toolCallId } : {}), snapshot: fs.readFileSync(publicPath, "utf-8") });
+	const assertFinalIndexed = (dir: string, publicPath: string): void => {
+		assert.equal(JSON.parse(fs.readFileSync(publicPath, "utf-8")).toolCallId, "call-a");
+		assert.equal(resultPayloadPathForSessionRun(dir, sessionId, runId), publicPath);
+		assert.equal(resultPayloadPathForIndexedRun(dir, runId), publicPath);
+		assert.equal(resultPayloadPathForMissionObserverRun(dir, runId), publicPath);
+		assert.deepEqual(resultFilesForToolCall(dir, "call-a"), [path.basename(publicPath)]);
+	};
+	const indexAndPendingFiles = (dir: string): string[] => ["result-index", "result-pending"]
+		.flatMap((name) => fs.existsSync(path.join(dir, name)) ? fs.readdirSync(path.join(dir, name), { recursive: true }).map(String) : [])
+		.filter((entry) => entry.endsWith(".json"));
+
+	it("keeps the final result and its indexes when a consumer retires the paused result it read", () => {
+		for (const fileName of [`${runId}.json`, "workflow-result.json"]) {
+			for (const promoted of [false, true]) {
+				const { dir, publicPath } = fixture(fileName);
+				try {
+					publishPaused(publicPath);
+					if (promoted) resultPayloadPathForIndexedRun(dir, runId);
+					const read = { runId, sessionId, snapshot: fs.readFileSync(promoted ? publicPath : pendingPath(dir, sessionId, runId), "utf-8") };
+					publishFinal(publicPath);
+
+					assert.equal(retireResultSnapshot(publicPath, read), "replaced", `${fileName} promoted=${promoted}`);
+					assertFinalIndexed(dir, publicPath);
+
+					assert.equal(retireResultSnapshot(publicPath, readPublic(publicPath, "call-a")), "retired");
+					assert.equal(fs.existsSync(publicPath), false);
+					assert.deepEqual(indexAndPendingFiles(dir), []);
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			}
+		}
+	});
+
+	it("never publishes a final result inside a consumer's retirement", (t) => {
+		const originalRmSync = fsDefault.rmSync;
+		const { dir, publicPath } = fixture();
+		try {
+			publishPaused(publicPath);
+			resultPayloadPathForIndexedRun(dir, runId);
+			const pausedRead = readPublic(publicPath);
+			let retiring = false;
+			let blocked = 0;
+			t.mock.method(fsDefault, "rmSync", (target: fs.PathLike, options?: fs.RmOptions) => {
+				if (retiring && String(target) === publicPath) {
+					retiring = false;
+					assert.throws(() => publishFinal(publicPath), /Timed out waiting/);
+					blocked += 1;
+				}
+				return originalRmSync(target, options);
+			});
+			syncBuiltinESMExports();
+			retiring = true;
+			assert.equal(retireResultSnapshot(publicPath, pausedRead), "retired");
+			assert.equal(blocked, 1);
+			publishFinal(publicPath);
+			assertFinalIndexed(dir, publicPath);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the final result's mission observer index when the paused result's observer acknowledges", () => {
+		const { dir, publicPath } = fixture();
+		try {
+			publishPaused(publicPath);
+			resultPayloadPathForIndexedRun(dir, runId);
+			const read = readPublic(publicPath);
+			publishFinal(publicPath);
+
+			assert.equal(acknowledgeMissionObserverSnapshot(publicPath, read), "replaced");
+			assertFinalIndexed(dir, publicPath);
+
+			assert.equal(acknowledgeMissionObserverSnapshot(publicPath, readPublic(publicPath, "call-a")), "acknowledged");
+			assert.equal(resultPayloadPathForMissionObserverRun(dir, runId), undefined);
+			assert.equal(resultPayloadPathForSessionRun(dir, sessionId, runId), publicPath);
+			assert.equal(resultPayloadPathForIndexedRun(dir, runId), publicPath);
+			assert.deepEqual(resultFilesForToolCall(dir, "call-a"), [path.basename(publicPath)]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a pending final result that a reader promotes while the paused result is being retired", (t) => {
+		const { dir, publicPath } = fixture();
+		const originalRenameSync = fsDefault.renameSync;
+		const originalRmSync = fsDefault.rmSync;
+		try {
+			publishPaused(publicPath);
+			resultPayloadPathForIndexedRun(dir, runId);
+			const read = readPublic(publicPath);
+			// The final result's promotion is denied, so it stays pending next to the public paused result.
+			t.mock.method(fsDefault, "renameSync", (source: fs.PathLike, target: fs.PathLike) => {
+				if (String(target) === publicPath) throw Object.assign(new Error("denied"), { code: "EPERM" });
+				return originalRenameSync(source, target);
+			});
+			syncBuiltinESMExports();
+			publishFinal(publicPath);
+			t.mock.restoreAll();
+			assert.equal(fs.readFileSync(publicPath, "utf-8"), read.snapshot);
+			assert.equal(fs.existsSync(pendingPath(dir, sessionId, runId)), true);
+			// Another process's ordinary lookup promotes the pending final result just before a deletion.
+			let promoted = false;
+			t.mock.method(fsDefault, "rmSync", (target: fs.PathLike, options?: fs.RmOptions) => {
+				if (!promoted) {
+					promoted = true;
+					resultPayloadPathForIndexedRun(dir, runId);
+				}
+				return originalRmSync(target, options);
+			});
+			syncBuiltinESMExports();
+
+			assert.equal(retireResultSnapshot(publicPath, read), "replaced");
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			assertFinalIndexed(dir, publicPath);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("treats an older public result beside the pending one a consumer read as not newer, and a later one as newer", (t) => {
+		for (const laterPublished of [false, true]) {
+			const { dir, publicPath } = fixture();
+			const originalRenameSync = fsDefault.renameSync;
+			try {
+				publishPaused(publicPath);
+				resultPayloadPathForIndexedRun(dir, runId);
+				const stalePublic = fs.readFileSync(publicPath, "utf-8");
+				// The final result's promotion is denied, so the consumer reads it from pending beside the paused one.
+				t.mock.method(fsDefault, "renameSync", (source: fs.PathLike, target: fs.PathLike) => {
+					if (String(target) === publicPath) throw Object.assign(new Error("denied"), { code: "EPERM" });
+					return originalRenameSync(source, target);
+				});
+				syncBuiltinESMExports();
+				publishFinal(publicPath);
+				t.mock.restoreAll();
+				syncBuiltinESMExports();
+				const read = { runId, sessionId, toolCallId: "call-a", stalePublic, snapshot: fs.readFileSync(pendingPath(dir, sessionId, runId), "utf-8") };
+				if (!laterPublished) {
+					assert.equal(acknowledgeMissionObserverSnapshot(publicPath, read), "acknowledged");
+					assert.equal(retireResultSnapshot(publicPath, read), "retired");
+					assert.deepEqual([fs.existsSync(publicPath), ...indexAndPendingFiles(dir)], [false]);
+					continue;
+				}
+				withResultRunLease(dir, runId, () => { writeAsyncResultFile(publicPath, { ...final(dir), summary: "Completed after resume." }); });
+				assert.equal(acknowledgeMissionObserverSnapshot(publicPath, read), "replaced");
+				assert.equal(retireResultSnapshot(publicPath, read), "replaced");
+				assert.equal(JSON.parse(fs.readFileSync(publicPath, "utf-8")).summary, "Completed after resume.");
+				assertFinalIndexed(dir, publicPath);
+			} finally {
+				t.mock.restoreAll();
+				syncBuiltinESMExports();
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("neither steals a busy run lease nor removes anything without it, while lookups take no lease", () => {
+		const { dir, publicPath } = fixture();
+		try {
+			publishPaused(publicPath);
+			resultPayloadPathForIndexedRun(dir, runId);
+			const read = readPublic(publicPath);
+			withResultRunLease(dir, runId, () => {
+				assert.throws(() => retireResultSnapshot(publicPath, read), /Timed out waiting/);
+				assert.throws(() => acknowledgeMissionObserverSnapshot(publicPath, read), /Timed out waiting/);
+				assert.equal(resultPayloadPathForSessionRun(dir, sessionId, runId), publicPath);
+				assert.equal(resultPayloadPathForIndexedRun(dir, runId), publicPath);
+				assert.equal(resultPayloadPathForMissionObserverRun(dir, runId), publicPath);
+				assert.deepEqual(resultFilesForSession(dir, sessionId), [path.basename(publicPath)]);
+			});
+			assert.equal(fs.readFileSync(publicPath, "utf-8"), read.snapshot);
+			assert.equal(resultPayloadPathForMissionObserverRun(dir, runId), publicPath);
+			assert.equal(retireResultSnapshot(publicPath, read), "retired");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 });

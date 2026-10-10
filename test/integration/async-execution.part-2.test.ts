@@ -16,6 +16,7 @@ import { createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, resolv
 import { deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, requestAsyncSteer } from "../../src/runs/background/control-channel.ts";
 import { writeAtomicJson } from "../../src/shared/atomic-json.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
+import { buildCompletionDetails, formatSingleCompletion } from "../../src/runs/background/notify.ts";
 import { SUBAGENT_ASYNC_STARTED_EVENT, SUBAGENT_LIFECYCLE_ARTIFACT_VERSION } from "../../src/shared/types.ts";
 import type { AsyncResultPayload, AsyncStatusPayload, MockPiCallRecord } from "../support/async-execution-fixture.ts";
 import {
@@ -1122,10 +1123,7 @@ syncBuiltinESMExports();
 			...commonParams,
 			ctx: { ...commonParams.ctx, interactive: true },
 		});
-		assert.match(interactiveResult.content[0]?.text ?? "", /interactive session/);
-		assert.match(interactiveResult.content[0]?.text ?? "", /return control to the user/);
-		assert.match(interactiveResult.content[0]?.text ?? "", /does not need a wait call/);
-		assert.match(interactiveResult.content[0]?.text ?? "", /native completion notification/);
+		assert.match(interactiveResult.content[0]?.text ?? "", /Return control now: native completion wakes you/);
 		assert.doesNotMatch(interactiveResult.content[0]?.text ?? "", /bg_wait\(\{ id:/);
 		assert.doesNotMatch(interactiveResult.content[0]?.text ?? "", /auto-drain/);
 		await waitForAsyncResultFile(interactiveId, 30_000);
@@ -1338,6 +1336,34 @@ syncBuiltinESMExports();
 		});
 		assert.ok(taskArgs.find((task) => task.includes("Write first"))?.includes(path.join("parallel-0", "0-worker", "context.md")));
 		assert.ok(taskArgs.find((task) => task.includes("Write second"))?.includes(path.join("parallel-0", "1-worker", "context.md")));
+	});
+
+	it("caps each long parallel child output saved to an explicit output file in the completion notice", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const report = (marker: string) => Array.from({ length: 200 }, (_, index) => `${marker} line ${index} ${"x".repeat(40)}`).join("\n");
+		mockPi.onCall({ matchArgIncludes: "Write first", output: report("alpha") });
+		mockPi.onCall({ matchArgIncludes: "Write second", output: report("beta") });
+		const id = `async-parallel-saved-cap-${Date.now().toString(36)}`;
+		executeAsyncChain(id, {
+			chain: [{ parallel: [{ agent: "worker", task: "Write first" }, { agent: "worker", task: "Write second" }] }],
+			resultMode: "parallel",
+			agents: [makeAgent("worker", { output: "report.md" })],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-parallel-saved-cap" },
+			artifactConfig: { enabled: true, includeInput: false, includeOutput: true, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			artifactsDir: path.join(tempDir, ".pi/subagents", "artifacts"),
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true);
+		const savedPaths = (payload.results as Array<{ savedOutputPath?: string }>).map((result) => result.savedOutputPath);
+		assert.ok(savedPaths[0] && savedPaths[1], `parallel results must record their saved output paths: ${JSON.stringify(savedPaths)}`);
+		const notice = formatSingleCompletion(buildCompletionDetails(payload as Parameters<typeof buildCompletionDetails>[0]));
+		for (const marker of ["alpha", "beta"]) {
+			assert.ok(notice.includes(`${marker} line 0 `));
+			assert.ok(!notice.includes(`${marker} line 199`), `${marker} output must be capped (notice is ${notice.length} chars)`);
+		}
+		for (const savedPath of savedPaths) assert.ok(notice.includes(`Output saved to: ${savedPath} (`));
 	});
 
 	it("async single preserves checked evidence while independent review is pending", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1631,13 +1657,13 @@ syncBuiltinESMExports();
 			path.join(outputDir, "dynamic-1", "0-reviewer", "context.md"),
 			path.join(outputDir, "dynamic-1", "1-reviewer", "context.md"),
 		];
-		assert.equal(fs.readFileSync(dynamicOutputPaths[0]!, "utf-8"), "review-a");
-		assert.equal(fs.readFileSync(dynamicOutputPaths[1]!, "utf-8"), "review-b");
+		assert.equal(fs.readFileSync(dynamicOutputPaths[0]!, "utf-8"), JSON.stringify({ ok: "a" }, null, 2));
+		assert.equal(fs.readFileSync(dynamicOutputPaths[1]!, "utf-8"), JSON.stringify({ ok: "b" }, null, 2));
 		const reviewerArtifacts = payload.results.slice(1, 3).map((result) => result.artifactPaths?.outputPath);
 		assert.ok(reviewerArtifacts[0] && reviewerArtifacts[1]);
 		assert.notEqual(reviewerArtifacts[0], reviewerArtifacts[1]);
-		assert.equal(fs.readFileSync(reviewerArtifacts[0], "utf-8"), "review-a");
-		assert.equal(fs.readFileSync(reviewerArtifacts[1], "utf-8"), "review-b");
+		assert.equal(fs.readFileSync(reviewerArtifacts[0], "utf-8"), JSON.stringify({ ok: "a" }, null, 2));
+		assert.equal(fs.readFileSync(reviewerArtifacts[1], "utf-8"), JSON.stringify({ ok: "b" }, null, 2));
 		assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", new RegExp(dynamicOutputPaths[0]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		assert.match(readMockPiArgs(mockPi, 2).at(-1) ?? "", new RegExp(dynamicOutputPaths[1]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		assert.equal(status.steps?.length, 4);
@@ -1707,6 +1733,43 @@ syncBuiltinESMExports();
 		assert.match(error, /materialized 2 items that resolve output to the same path/);
 		assert.match(error, /shared\.md/);
 		assert.equal(mockPi.callCount(), 1);
+	});
+
+	it("async dynamic fanout runs external-runner template children through the external runner", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ matchArgIncludes: "Produce targets", output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+		const reviewer = makeAgent("reviewer", {
+			runner: { type: "external-cli", command: process.execPath, args: ["-e", "let s='';process.stdin.on('data',c=>s+=c);process.stdin.on('end',()=>{const m=s.match(/Review (src\\/\\S+)/);process.stdout.write('external-review:'+(m?m[1]:'none'))})"] },
+		} as never);
+		const id = `async-dynamic-external-runner-${Date.now().toString(36)}`;
+		const launch = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 2 },
+					parallel: { agent: "reviewer", task: "Review {target.path}" },
+					collect: { as: "reviews" },
+					concurrency: 2,
+				},
+			],
+			agents: [makeAgent("producer"), reviewer],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-external-runner" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
+		const payload = await readAsyncPayload(id);
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.success, true, payload.results.find((result) => result.error)?.error);
+		assert.equal(mockPi.callCount(), 1);
+		assert.deepEqual(status.steps?.map((step) => step.agent), ["producer", "reviewer", "reviewer"]);
+		assert.deepEqual(status.steps?.slice(1).map((step) => step.runner?.type), ["external-cli", "external-cli"]);
+		const collected = payload.outputs?.reviews?.structured as Array<{ key: string; text: string; exitCode: number | null }>;
+		assert.deepEqual(collected.map((item) => item.key), ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(collected.map((item) => item.text), ["external-review:src/a.ts", "external-review:src/b.ts"]);
+		assert.deepEqual(collected.map((item) => item.exitCode), [0, 0]);
 	});
 
 	it("async dynamic fanout applies fork session files and thinking overrides to materialized children", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -2175,10 +2238,11 @@ syncBuiltinESMExports();
 				events.toolStart("write", { path: "side-effect.txt", content: "done" }),
 				events.toolEnd("write"),
 				events.toolResult("write", "Wrote side-effect.txt"),
-				{ type: "compaction_start" },
-				{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
+				{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "error", errorMessage: "This operation was aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } },
 				{ type: "agent_settled" },
+				{ type: "compaction_start" },
 			],
+			omitImplicitFinalEvents: true,
 			writeFiles: [{ path: "side-effect.txt", content: "done" }, { path: sessionFile, content: "{}\n" }],
 			keepAliveAfterFinalMessageMs: 5_000,
 			exitCode: 0,

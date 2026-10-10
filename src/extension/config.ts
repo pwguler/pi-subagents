@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Key } from "@earendil-works/pi-tui";
-import { FLEET_KEYBINDING_ACTIONS, type ArtifactDirPreference, type ExtensionConfig } from "../shared/types.ts";
+import { FLEET_KEYBINDING_ACTIONS, RUNNER_LAUNCHER_NAME_PATTERN, RUNNER_LAUNCHER_NAME_RULE, type ArtifactDirPreference, type ExtensionConfig } from "../shared/types.ts";
 import { validateMissionStoreConfig } from "../missions/store.ts";
 import { validateAuthorityPolicy } from "../policy/authority.ts";
 import { getAgentDir } from "../shared/utils.ts";
@@ -10,6 +10,11 @@ import { validatePermissionConfig } from "../runs/shared/permissions.ts";
 import { MAX_ABANDONED_SLOT_RELEASE_AFTER_MS, MIN_ABANDONED_SLOT_RELEASE_AFTER_MS } from "../runs/background/active-async-capacity.ts";
 import { normalizeWorktreeBranchPrefix } from "../runs/shared/worktree.ts";
 import { validateModelResponseAliases } from "../shared/model-response-aliases.ts";
+import { validateDisabledFeatures } from "../shared/disabled-features.ts";
+
+// Explicit route identity, worktree, checkpoint, and tool-surface policies must not be silently
+// discarded and replaced by the built-in defaults after validation fails.
+const FAIL_CLOSED_CONFIG_KEYS = ["worktreeProvider", "worktreeBranchPrefix", "modelResponseAliases", "modelExclusions", "checkpointBeforeDeadlineMs", "disabledFeatures", "scheduledRuns", "toolActivation", "authorityPolicy", "permissions", "toolBudget", "runnerLaunchers"];
 
 const ARTIFACT_DIR_PREFERENCES = new Set<ArtifactDirPreference>(["project", "session", "temp"]);
 const FLEET_KEYBINDING_ACTION_SET = new Set<string>(FLEET_KEYBINDING_ACTIONS);
@@ -55,6 +60,8 @@ export function resolveScheduledStoreRoot(value: string): string {
 function validateScheduledRunsConfig(value: unknown): void {
 	if (value === undefined) return;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.scheduledRuns must be a JSON object");
+	const enabled = (value as Record<string, unknown>).enabled;
+	if (enabled !== undefined && typeof enabled !== "boolean") throw new Error("config.scheduledRuns.enabled must be a boolean");
 	const storeRoot = (value as Record<string, unknown>).storeRoot;
 	if (storeRoot === undefined) return;
 	if (typeof storeRoot !== "string" || !storeRoot.trim()) throw new Error("config.scheduledRuns.storeRoot must be a non-empty string");
@@ -93,6 +100,18 @@ function validateCapacityConfig(value: unknown): void {
 			|| abandonedSlotReleaseAfterMs < MIN_ABANDONED_SLOT_RELEASE_AFTER_MS
 			|| abandonedSlotReleaseAfterMs > MAX_ABANDONED_SLOT_RELEASE_AFTER_MS)) {
 		throw new Error(`config.capacity.abandonedSlotReleaseAfterMs must be false or an integer from ${MIN_ABANDONED_SLOT_RELEASE_AFTER_MS} to ${MAX_ABANDONED_SLOT_RELEASE_AFTER_MS}`);
+	}
+}
+
+function validateRunnerLaunchersConfig(value: unknown): void {
+	if (value === undefined) return;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("config.runnerLaunchers must be a JSON object mapping launcher names to argv arrays");
+	for (const [name, argv] of Object.entries(value)) {
+		const label = `config.runnerLaunchers[${JSON.stringify(name)}]`;
+		if (!RUNNER_LAUNCHER_NAME_PATTERN.test(name)) throw new Error(`${label} has an invalid name; launcher names ${RUNNER_LAUNCHER_NAME_RULE}`);
+		if (!Array.isArray(argv) || argv.length === 0 || argv.some((arg) => typeof arg !== "string" || !arg.trim() || arg.includes("\u0000"))) {
+			throw new Error(`${label} must be a non-empty argv array of non-blank strings without NUL characters`);
+		}
 	}
 }
 
@@ -165,10 +184,23 @@ function validateConfig(config: Record<string, unknown>): void {
 	if (config.resultScanLogging !== undefined && config.resultScanLogging !== "all" && config.resultScanLogging !== "activity" && config.resultScanLogging !== "off") {
 		throw new Error('config.resultScanLogging must be "all", "activity", or "off"');
 	}
+	if (config.asyncWidgetCollapsed !== undefined && typeof config.asyncWidgetCollapsed !== "boolean") {
+		throw new Error("config.asyncWidgetCollapsed must be a boolean");
+	}
+	if (config.asyncWidgetLayout !== undefined && config.asyncWidgetLayout !== "adaptive" && config.asyncWidgetLayout !== "rows") {
+		throw new Error('config.asyncWidgetLayout must be "adaptive" or "rows"');
+	}
+	if (config.programStatus !== undefined && typeof config.programStatus !== "boolean") {
+		throw new Error("config.programStatus must be a boolean");
+	}
+	if (config.toolActivation !== undefined && config.toolActivation !== "auto" && config.toolActivation !== "dynamic" && config.toolActivation !== "eager") {
+		throw new Error('config.toolActivation must be "auto", "dynamic", or "eager"');
+	}
 	validateMissionStoreConfig(config.missions);
 	validateAuthorityPolicy(config.authorityPolicy);
 	validatePermissionConfig(config.permissions);
 	validateScheduledRunsConfig(config.scheduledRuns);
+	validateDisabledFeatures(config.disabledFeatures);
 	validateFleetKeybindingsConfig(config.fleetKeybindings);
 	validateArtifactConfig(config.artifactConfig);
 	validateCapacityConfig(config.capacity);
@@ -176,6 +208,7 @@ function validateConfig(config: Record<string, unknown>): void {
 	validateModelResponseAliases(config.modelResponseAliases);
 	validateMainWindowRendererConfig(config.mainWindowRenderer);
 	validateOrcaProgressTabsConfig(config.orcaProgressTabs);
+	validateRunnerLaunchersConfig(config.runnerLaunchers);
 }
 
 export function getConfigPath(): string {
@@ -215,12 +248,9 @@ export function loadConfig(): ExtensionConfig {
 		return readConfigForUpdate(configPath);
 	} catch (error) {
 		if (error instanceof PrunedForkConfigError) throw error;
-		// Explicit route identity, worktree, and checkpoint policies must not be silently
-		// discarded and replaced by the built-in defaults after validation fails.
 		try {
 			const raw = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
-			if (raw && typeof raw === "object" && !Array.isArray(raw)
-				&& (Object.hasOwn(raw, "worktreeProvider") || Object.hasOwn(raw, "worktreeBranchPrefix") || Object.hasOwn(raw, "modelResponseAliases") || Object.hasOwn(raw, "modelExclusions") || Object.hasOwn(raw, "checkpointBeforeDeadlineMs"))) throw error;
+			if (raw && typeof raw === "object" && !Array.isArray(raw) && FAIL_CLOSED_CONFIG_KEYS.some((key) => Object.hasOwn(raw, key))) throw error;
 		} catch (readError) {
 			if (readError === error) throw error;
 		}

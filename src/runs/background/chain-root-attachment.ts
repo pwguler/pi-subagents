@@ -13,7 +13,8 @@ export interface ImportedAsyncRoot {
 
 export interface ImportedAsyncRootResult {
 	agent: string;
-	importedPublication?: { sessionId?: string; toolCallId?: string };
+	/** `snapshot` is the payload text this result was built from, so cleanup can tell it from a newer one. */
+	importedPublication?: { sessionId?: string; toolCallId?: string; snapshot: string };
 	/** Human-readable display name for the child session, when derived at launch. */
 	sessionName?: string;
 	output: string;
@@ -83,18 +84,20 @@ interface AsyncResultFile {
 const TERMINAL_STATES = new Set(["complete", "failed", "partial", "paused", "stopped"]);
 const TERMINAL_STEP_STATUSES = new Set(["complete", "completed", "failed", "partial", "paused", "stopped"]);
 
-function readResultFile(resultPath: string): AsyncResultFile | undefined {
+function readResultFile(resultPath: string): { data: AsyncResultFile; raw: string } | undefined {
+	let raw: string;
 	try {
-		return JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultFile;
+		raw = fs.readFileSync(resultPath, "utf-8");
 	} catch (error) {
 		if (typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
 			return undefined;
 		}
 		throw error;
 	}
+	return { data: JSON.parse(raw) as AsyncResultFile, raw };
 }
 
-function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null): AsyncResultFile | undefined {
+function readImportedResultFile(root: ImportedAsyncRoot, status: AsyncStatus | null): { data: AsyncResultFile; raw: string } | undefined {
 	const direct = readResultFile(root.resultPath);
 	if (direct || !status?.sessionId) return direct;
 	const indexedPath = resultPayloadPathForSessionRun(path.dirname(root.resultPath), status.sessionId, root.runId);
@@ -161,7 +164,7 @@ function outputFromTerminalStatus(root: ImportedAsyncRoot, status: AsyncStatus, 
 	};
 }
 
-function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, message: string): ImportedAsyncRootResult {
+function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, message: string, stopped = false): ImportedAsyncRootResult {
 	const step = selectedStatusStep(status, root.index);
 	return {
 		agent: step?.agent ?? status?.steps?.[root.index]?.agent ?? "subagent",
@@ -169,7 +172,7 @@ function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, 
 		success: false,
 		exitCode: 1,
 		error: message,
-		timedOut: true,
+		...(stopped ? { stopped: true } : { timedOut: true }),
 		...(step?.sessionName ? { sessionName: step.sessionName } : {}),
 		...(step?.sessionFile ?? status?.sessionFile ? { sessionFile: step?.sessionFile ?? status?.sessionFile } : {}),
 		...(step?.model ? { model: step.model } : {}),
@@ -180,7 +183,7 @@ function outputFromTimeout(root: ImportedAsyncRoot, status: AsyncStatus | null, 
 	};
 }
 
-function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, result: AsyncResultFile): ImportedAsyncRootResult {
+function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null, { data: result, raw }: { data: AsyncResultFile; raw: string }): ImportedAsyncRootResult {
 	const child = result.results?.[root.index];
 	const step = selectedStatusStep(status, root.index);
 	const state = resultState(result, child);
@@ -197,6 +200,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 		importedPublication: {
 			...(typeof result.sessionId === "string" ? { sessionId: result.sessionId } : {}),
 			...(typeof result.toolCallId === "string" ? { toolCallId: result.toolCallId } : {}),
+			snapshot: raw,
 		},
 		output: success ? output : (output || error || ""),
 		success,
@@ -228,7 +232,7 @@ function buildImportedResult(root: ImportedAsyncRoot, status: AsyncStatus | null
 
 export async function waitForImportedAsyncRoot(
 	root: ImportedAsyncRoot,
-	options: { pollIntervalMs?: number; terminalResultGraceMs?: number; now?: () => number; shouldAbort?: () => boolean; timeoutMessage?: string } = {},
+	options: { pollIntervalMs?: number; terminalResultGraceMs?: number; now?: () => number; shouldAbort?: () => boolean; timeoutMessage?: string; abortedAsStopped?: boolean } = {},
 ): Promise<ImportedAsyncRootResult> {
 	const pollIntervalMs = options.pollIntervalMs ?? 500;
 	const terminalResultGraceMs = options.terminalResultGraceMs ?? 1_000;
@@ -236,7 +240,7 @@ export async function waitForImportedAsyncRoot(
 	let terminalSince: number | undefined;
 	for (;;) {
 		const status = readStatus(root.asyncDir);
-		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? "Subagent timed out.");
+		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? "Subagent timed out.", options.abortedAsStopped === true);
 		const result = readImportedResultFile(root, status);
 		if (result) return buildImportedResult(root, status, result);
 		if (isTerminalStatus(status, root.index)) {

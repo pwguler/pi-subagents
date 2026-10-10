@@ -21,6 +21,8 @@ import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapac
 import { readPendingChainAppendRequests } from "../../src/runs/background/chain-append.ts";
 import { readActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { createRunFanoutBudget, getRunFanoutBudgetSnapshot, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
+import { writeRetainedRequiredChildExtensions } from "../../src/shared/required-child-extensions.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { deriveForkPromptCacheKey } from "../../src/runs/shared/child-tool-plan.ts";
 import { INVALID_STRUCTURED_OUTPUT_SCHEMA_ERROR, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
@@ -379,12 +381,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const call = await waitForMockPiCall(mockPi, 0);
 		const taskArg = call.args.at(-1) ?? "";
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
-		for (const instruction of [taskArg, systemPrompt]) {
-			assert.match(instruction, /Return the complete artifact in your final response\./);
-			assert.match(instruction, /runtime will persist it to exactly this path:/);
-			assert.match(instruction, /Do not call contact_supervisor merely because no write-capable tool is available\./);
-			assert.doesNotMatch(instruction, /Write your findings to exactly this path/);
-		}
+		assert.match(taskArg, /Return the complete artifact in your final response\./);
+		assert.match(taskArg, /runtime will persist it to exactly this path:/);
+		assert.match(taskArg, /Do not call contact_supervisor merely because no write-capable tool is available\./);
+		assert.doesNotMatch(taskArg, /Write your findings to exactly this path/);
+		assert.doesNotMatch(systemPrompt, /runtime will persist it to exactly this path:/);
 		const deadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {
 			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
@@ -471,7 +472,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(fs.existsSync(path.join(tempDir, "context.md")), false);
 	});
 
-	it("background single runs make output overrides authoritative in the child system prompt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("background single runs deliver the output override in the task and keep it out of the child system prompt", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "async override report" });
 		const id = `async-output-override-system-prompt-${Date.now().toString(36)}`;
 		const outputPath = path.join(tempDir, "async-custom-report.md");
@@ -502,10 +503,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const taskArg = call.args.at(-1) ?? "";
 		const systemPrompt = call.systemPrompts[0]?.text ?? "";
 		assert.match(taskArg, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(outputPath)}`));
+		assert.match(taskArg, /Ignore any other output filename or output path mentioned elsewhere/);
 		assert.match(systemPrompt, /Output format \(`default-report\.md`\):/);
-		assert.match(systemPrompt, /Runtime output path override:/);
-		assert.match(systemPrompt, new RegExp(`Write your findings to exactly this path: ${escapeRegExp(outputPath)}`));
-		assert.match(systemPrompt, /Ignore any other output filename or output path mentioned elsewhere/);
+		assert.doesNotMatch(systemPrompt, new RegExp(escapeRegExp(outputPath)));
+		assert.doesNotMatch(systemPrompt, /Write your findings to exactly this path/);
 		await waitForAsyncResultFile(id);
 	});
 
@@ -768,7 +769,7 @@ export default function() {
 
 	it("background single runs support outputSchema", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const expectedStructuredOutput = { ok: true, note: "async" };
-		mockPi.onCall({ output: "", structuredOutput: expectedStructuredOutput });
+		mockPi.onCall({ output: "Enough; writing up.", structuredOutput: expectedStructuredOutput });
 		const id = `async-single-schema-${Date.now().toString(36)}`;
 		const outputPath = path.join(tempDir, `${id}.json`);
 
@@ -1944,6 +1945,99 @@ syncBuiltinESMExports();
 		} finally {
 			fs.rmSync(asyncDir, { recursive: true, force: true });
 			fs.rmSync(budget.directory, { recursive: true, force: true });
+		}
+	});
+
+	it("append-step admits against the run's retained mandatory extensions after the host registration is gone", { skip: !createSubagentExecutor ? "executor not available" : undefined }, async () => {
+		const runId = `append-required-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, runId);
+		const budget = createRunFanoutBudget(runId, 8);
+		const snapshot = [{ id: "host-policy", path: fileURLToPath(import.meta.url), requireForAllRunners: true as const }];
+		try {
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId, sessionId: "session-123", mode: "chain", state: "running", startedAt: 100, lastUpdate: 200, cwd: tempDir, chainStepCount: 1,
+				steps: [{ agent: "worker", status: "running" }],
+			}));
+			writeRunFanoutBudgetDescriptor(asyncDir, budget);
+			writeRetainedRequiredChildExtensions(asyncDir, snapshot);
+			const executor = makeAsyncExecutor([makeAgent("worker"), makeAgent("external", { runner: { type: "external-cli", command: process.execPath } })]);
+			const append = (agent: string) => executor.execute(`append-required-${agent}`, { action: "append-step", id: runId, step: { agent, task: "Review" } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as Promise<AsyncExecutionResult>;
+
+			const rejected = await append("external");
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0]?.text ?? "", /requires child extensions \(host-policy\) for every runner/);
+			assert.equal(readPendingChainAppendRequests(asyncDir).length, 0);
+
+			const admitted = await append("worker");
+			assert.equal(admitted.isError, undefined, admitted.content[0]?.text ?? "append failed");
+			assert.deepEqual(readPendingChainAppendRequests(asyncDir)[0]?.steps[0]?.requiredExtensions, snapshot);
+		} finally {
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			fs.rmSync(budget.directory, { recursive: true, force: true });
+		}
+	});
+
+	it("append-step queues only agents whose launcher matches the running runner's, refusing before progress files are written", { skip: !createSubagentExecutor ? "executor not available" : undefined }, async () => {
+		const budget = (runId: string) => createRunFanoutBudget(runId, 8);
+		const progressPath = path.join(tempDir, "progress.md");
+		const agents = [makeAgent("worker"), makeAgent("netA", { launcher: "a" }), makeAgent("netA2", { launcher: "a" }), makeAgent("netB", { launcher: "b" })];
+		const executor = makeAsyncExecutor(agents, { runnerLaunchers: { a: ["true"], b: ["true"] } });
+		const cases: Array<[{ name: string; argv: string[] } | undefined, string, boolean]> = [
+			[{ name: "a", argv: ["true"] }, "netA2", true],
+			[{ name: "a", argv: ["true"] }, "netB", false],
+			[{ name: "a", argv: ["true"] }, "worker", false],
+			[undefined, "netA", false],
+		];
+		for (const [index, [launcher, agent, admitted]] of cases.entries()) {
+			const runId = `append-launcher-${index}-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			const runBudget = budget(runId);
+			try {
+				fs.mkdirSync(asyncDir, { recursive: true });
+				fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+					runId, sessionId: "session-123", mode: "chain", state: "running", startedAt: 100, lastUpdate: 200, cwd: tempDir, chainStepCount: 1,
+					...(launcher ? { launcher } : {}), steps: [{ agent: launcher ? "netA" : "worker", status: "running" }],
+				}));
+				writeRunFanoutBudgetDescriptor(asyncDir, runBudget);
+				fs.writeFileSync(progressPath, "existing progress\n");
+				const result = await executor.execute(`append-launcher-${index}`, { action: "append-step", id: runId, step: { parallel: [{ agent, task: "Work", progress: true }] } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+				if (admitted) {
+					assert.equal(result.isError, undefined, result.content[0]?.text);
+					assert.equal(readPendingChainAppendRequests(asyncDir).length, 1);
+					assert.deepEqual(getRunFanoutBudgetSnapshot(runBudget), { used: 1, limit: 8, remaining: 7 });
+				} else {
+					assert.equal(result.isError, true, `case ${index}`);
+					assert.match(result.content[0]?.text ?? "", /its runner uses (?:launcher '\w+'|no launcher), but the appended agents use/);
+					assert.equal(readPendingChainAppendRequests(asyncDir).length, 0);
+					assert.deepEqual(getRunFanoutBudgetSnapshot(runBudget), { used: 0, limit: 8, remaining: 8 });
+					assert.equal(fs.readFileSync(progressPath, "utf-8"), "existing progress\n");
+				}
+			} finally {
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+				fs.rmSync(runBudget.directory, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("workflow children keep the mandatory extensions admitted with the workflow after the host disposes its registration", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const childCwd = path.join(tempDir, "required-child");
+		fs.mkdirSync(childCwd, { recursive: true });
+		const registration = registerRequiredChildExtensions({ sessionId: "session-123", extensions: [{ id: "host-policy", path: fileURLToPath(import.meta.url) }], requireForAllRunners: true });
+		const agents = [makeAgent("external", { runner: { type: "external-cli", command: process.execPath, args: ["-e", ""] } })];
+		// The child's own agent discovery runs after workflow admission and before its launch: dispose there.
+		const executor = makeAsyncExecutor(agents, {}, (cwd) => {
+			if (cwd === childCwd) registration.dispose();
+			return { agents };
+		});
+		try {
+			const result = await executor.execute("workflow-required-disposed", {
+				async: false,
+				workflowScript: `return runs.run("ext", { agent: "external", task: "Review", cwd: ${JSON.stringify(childCwd)} });`,
+			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir)) as AsyncExecutionResult;
+			assert.match(JSON.stringify(result), /requires child extensions \(host-policy\) for every runner/);
+		} finally {
+			registration.dispose();
 		}
 	});
 

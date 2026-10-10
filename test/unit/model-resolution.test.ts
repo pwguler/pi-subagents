@@ -60,6 +60,14 @@ describe("single model resolution", () => {
 		assert.equal(resolveEffectiveSubagentModel("missing", "gpt-5-mini", undefined, models, undefined, { source: "inherited" }), "missing");
 	});
 
+	it("lists up to five exact registry ids for an unknown or ambiguous model", () => {
+		assert.throws(() => resolveModelSelection("gpt-5-mni:high", models), /Unknown subagent model 'gpt-5-mni:high'.*Closest registry models: openai\/gpt-5-mini:high\./);
+		assert.throws(() => resolveModelSelection("shared", models), /Unknown subagent model 'shared'.*Closest registry models: anthropic\/shared, openai\/shared\./);
+		const crowded = ["a", "b", "c", "d", "e", "f", "g"].map((provider) => ({ provider, id: "same", fullId: `${provider}/same` }));
+		assert.throws(() => resolveModelSelection("same", crowded), (error: Error) => /Closest registry models: a\/same, b\/same, c\/same, d\/same, e\/same\.$/.test(error.message));
+		assert.throws(() => resolveModelSelection("missing", models), (error: Error) => !error.message.includes("Closest registry models"));
+	});
+
 	it("normalizes registry spelling without switching a qualified provider", () => {
 		assert.equal(normalizeModelSegment("GPT_5--MINI"), "gpt-5-mini");
 		assert.equal(fuzzyResolveModel("GPT_5_MINI", models), "openai/gpt-5-mini");
@@ -126,6 +134,15 @@ describe("model response identity", () => {
 		assert.match(formatSubagentModelVerificationError("openai/gpt-5-mini", "gateway-model", models, {
 			"anthropic/claude-sonnet-4": ["gateway-model"],
 		}) ?? "", /model_verification_failed/);
+	});
+
+	it("verifies a virtual-model child against its exact selection, not the dispatched model", () => {
+		assert.equal(formatSubagentModelVerificationError("openai/gpt-5-mini:high", "anthropic/claude-sonnet-4", models, undefined, "openai/gpt-5-mini"), undefined);
+		const virtualMismatch = formatSubagentModelVerificationError("openai/gpt-5-mini", "gpt-5-mini", models, undefined, "other-router/gpt-5-mini") ?? "";
+		assert.match(virtualMismatch, /model_verification_failed: native Pi child selected virtual model 'other-router\/gpt-5-mini'/);
+		assert.doesNotMatch(virtualMismatch, /declare the exact mapping/);
+		assert.match(formatSubagentModelVerificationError("openai/gpt-5-mini", "gpt-5-mini", models, undefined, "gpt-5-mini") ?? "", /model_verification_failed/);
+		assert.match(formatSubagentModelVerificationError("openai/gpt-5-mini", "anthropic/claude-sonnet-4", models) ?? "", /model_verification_failed/);
 	});
 });
 

@@ -152,6 +152,7 @@ async function withIsolatedHome<T>(fn: () => Promise<T>): Promise<T> {
 function createCommandContext(
 	overrides: Partial<{
 		cwd: string;
+		mode: "tui" | "rpc" | "print";
 		hasUI: boolean;
 		custom: (...args: unknown[]) => Promise<unknown>;
 		notify: (message: string, type?: string) => void;
@@ -173,6 +174,7 @@ function createCommandContext(
 ) {
 	return {
 		cwd: overrides.cwd ?? process.cwd(),
+		mode: overrides.mode ?? (overrides.hasUI ? "tui" : "print"),
 		hasUI: overrides.hasUI ?? false,
 		ui: {
 			notify: overrides.notify ?? ((_message: string) => {}),
@@ -211,7 +213,6 @@ function writeProjectChain(root: string, fileName: string, content: string): voi
 
 function createWatchdogHarness(review?: WatchdogReviewFunction) {
 	const commands = new Map<string, RegisteredSlashCommand>();
-	const renderers = new Map<string, (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined>();
 	const sent: unknown[] = [];
 	const entries: Array<{ customType: string; data: unknown }> = [];
 	const pi = {
@@ -219,16 +220,14 @@ function createWatchdogHarness(review?: WatchdogReviewFunction) {
 		on() {},
 		registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
 		registerShortcut() {},
-		registerMessageRenderer(type: string, renderer: (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined) {
-			renderers.set(type, renderer);
-		},
+		registerMessageRenderer() {},
 		registerEntryRenderer() {},
 		appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
 		getThinkingLevel() { return "medium" as const; },
 		sendMessage(message: unknown) { sent.push(message); },
 	};
 	const runtime = registerMainWatchdog!(pi as never, review ? { review } : undefined);
-	return { commands, renderers, runtime, sent, entries };
+	return { commands, runtime, sent, entries };
 }
 
 async function captureSlashCommandParams(
@@ -236,6 +235,7 @@ async function captureSlashCommandParams(
 	args: string,
 	cwd: string,
 	setup?: (pi: RuntimeSlashPi) => void,
+	ctxOverrides: Parameters<typeof createCommandContext>[0] = {},
 ): Promise<{ params: unknown; notifications: string[] }> {
 	return withIsolatedHome(async () => {
 		const commands = new Map<string, RegisteredSlashCommand>();
@@ -275,6 +275,7 @@ async function captureSlashCommandParams(
 				notify: (message) => {
 					notifications.push(message);
 				},
+				...ctxOverrides,
 			}));
 			return { params: requestedParams, notifications };
 		} finally {
@@ -469,7 +470,7 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 
 	it("routes explicit low and medium test findings to entries and high findings to messages", async () => {
 		await withIsolatedHome(async () => {
-			const { commands, renderers, sent, entries } = createWatchdogHarness();
+			const { commands, sent, entries } = createWatchdogHarness();
 			await commands.get("subagents-watchdog")!.handler("test concern low check the concern", createCommandContext());
 			await commands.get("subagents-watchdog")!.handler("test concern medium check the medium concern", createCommandContext());
 			await commands.get("subagents-watchdog")!.handler("test blocker high check the blocker", createCommandContext());
@@ -481,11 +482,8 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 			assert.equal(blocker.details?.severity, "blocker");
 			assert.equal(blocker.details?.importance, "high");
 			assert.match(blocker.content ?? "", /<blocker_guidance>/);
-
-			const renderer = renderers.get("subagent_watchdog_warning")!;
-			const rendered = renderer(blocker as never, { expanded: true }, { fg: (_name, value) => value, bold: (value) => value })!.render(100).join("\n");
-			assert.match(rendered, /Subagent watchdog Blocker \(displayed\): check the blocker/);
-			assert.match(rendered, /Manual \/subagents-watchdog test blocker message/);
+			assert.match(blocker.content ?? "", /<summary>check the blocker<\/summary>/);
+			assert.match(blocker.content ?? "", /Manual \/subagents-watchdog test blocker message/);
 		});
 	});
 
@@ -591,7 +589,7 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 			const branch = [
 				{ type: "message", message: { role: "assistant", usage: { input: 10, output: 2, cacheRead: 30, cacheWrite: 0, cost: { total: 0.2 } } } },
 				{ type: "compaction", usage: { input: 5, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.05 } } },
-				{ type: "message", message: { role: "toolResult", toolName: "subagent", details: { mode: "workflow", runId: workflowRunId, results: [] } } },
+				{ type: "message", message: { role: "toolResult", toolName: "subagent", details: { mode: "workflow", runId: workflowRunId, asyncId: workflowRunId, results: [] } } },
 			];
 			try {
 				registerSlashCommands!(pi as never, createState(root));
@@ -743,6 +741,13 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		let opened = 0;
 		await commands.get("subagents-fleet")!.handler("", createCommandContext({ hasUI: true, custom: async () => { opened += 1; return undefined; } }));
 		assert.equal(opened, 1);
+	});
+
+	it("/subagents-fleet answers with the fleet status over RPC, where ui.custom is a no-op", async () => {
+		let opened = 0;
+		const { params } = await captureSlashCommandParams("subagents-fleet", "", process.cwd(), undefined, { mode: "rpc", hasUI: true, custom: async () => { opened += 1; return undefined; } });
+		assert.equal(opened, 0);
+		assert.deepEqual(params, { action: "status", view: "fleet" });
 	});
 
 	it("/subagents-stop keeps the selector within its allocated width", async () => {

@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
+	formatUnresolvedBuiltinMcpSelectors,
 	formatUnresolvedMcpDirectToolSelectors,
 	resolveMcpDirectToolResolution,
 	type McpRuntimeSnapshotHost,
@@ -21,6 +22,7 @@ import {
 } from "../../shared/types.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 import { getAgentDir } from "../../shared/utils.ts";
+import { resolveRuntimeModulePath, RUNTIME_MODULE_EXTENSIONS } from "../../shared/runtime-module-path.ts";
 import type { PermissionRules } from "./permissions.ts";
 import { snapshotRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import {
@@ -32,26 +34,14 @@ import {
 } from "./capability-ceiling.ts";
 
 const MAX_LAUNCH_RESOLVED_EXTENSION_IDS = 32;
-const PROMPT_RUNTIME_EXTENSION_PATH = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	`subagent-prompt-runtime${path.extname(fileURLToPath(import.meta.url))}`,
-);
-const FANOUT_CHILD_EXTENSION_PATH = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	"..",
-	"..",
-	"extension",
-	`fanout-child${path.extname(fileURLToPath(import.meta.url))}`,
-);
-const FAST_MODE_EXTENSION_PATH = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	`fast-mode-extension${path.extname(fileURLToPath(import.meta.url))}`,
-);
+const RUNTIME_EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
+const FANOUT_CHILD_EXTENSION_DIR = path.join(RUNTIME_EXTENSION_DIR, "..", "..", "extension");
+
 const SUBAGENT_RUNTIME_EXTENSION_PATHS = new Set([
-	PROMPT_RUNTIME_EXTENSION_PATH,
-	FANOUT_CHILD_EXTENSION_PATH,
-	FAST_MODE_EXTENSION_PATH,
-].map((extensionPath) => path.normalize(extensionPath)));
+	path.join(RUNTIME_EXTENSION_DIR, "subagent-prompt-runtime"),
+	path.join(RUNTIME_EXTENSION_DIR, "fast-mode-extension"),
+	path.join(FANOUT_CHILD_EXTENSION_DIR, "fanout-child"),
+].flatMap((base) => RUNTIME_MODULE_EXTENSIONS.map((extension) => path.normalize(`${base}${extension}`))));
 
 /** True for the extension files pi-subagents itself installs in child sessions. */
 export function isSubagentRuntimeExtensionPath(extensionPath: string): boolean {
@@ -123,7 +113,7 @@ function resolveFastModeExtension(input: Pick<ResolvePiLaunchToolPlanInput, "fas
 	if (unsupported.length > 0) {
 		throw new Error(`fast mode supports only native ${FAST_MODE_PROVIDER_PREFIX}* models; unsupported model${unsupported.length === 1 ? "" : "s"}: ${unsupported.join(", ")}.`);
 	}
-	return [FAST_MODE_EXTENSION_PATH];
+	return [resolveRuntimeModulePath(RUNTIME_EXTENSION_DIR, "fast-mode-extension")];
 }
 
 export interface ResolvePiLaunchToolPlanInput {
@@ -150,6 +140,8 @@ export interface ResolvePiLaunchToolPlanInput {
 	agentName?: string;
 	permissionRules?: PermissionRules;
 	runtimeSnapshotHost?: McpRuntimeSnapshotHost;
+	/** The parent's built-in MCP selections; the background runner has no host to resolve selectors against. */
+	builtinMcpTools?: ResolvedMcpDirectToolSelection[];
 }
 
 export interface PiLaunchToolPlan {
@@ -161,6 +153,8 @@ export interface PiLaunchToolPlan {
 	resolvedMcpSelections: ResolvedMcpDirectToolSelection[];
 	effectiveMcpSelections: ResolvedMcpDirectToolSelection[];
 	effectiveMcpTools: string[];
+	/** Effective selections granted from Pi's built-in MCP; undefined when the selectors did not resolve against it. */
+	builtinMcpTools?: ResolvedMcpDirectToolSelection[];
 	explicitToolAllowlist: boolean;
 	internalTools: string[];
 	effectiveToolAllowlist: string[];
@@ -320,7 +314,7 @@ export function resolvePiLaunchToolPlan(
 	const ceilingFilteredBuiltinTools =
 		input.tools === undefined
 			? allowedToolSet
-				? [...allowedToolSet]
+				? [...allowedToolSet].filter((tool) => tool !== "subagent_command")
 				: []
 			: (input.requireReadTool &&
 				requestedBuiltinTools.length > 0 &&
@@ -350,16 +344,21 @@ export function resolvePiLaunchToolPlan(
 			);
 	const mcpResolution = capabilityCeiling?.denyExtensions
 		? { selections: [], unresolvedSelectors: [] }
-		: resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
+		: input.builtinMcpTools
+			// The runner applies the same ceilings again; filtering is idempotent.
+			? { selections: input.builtinMcpTools, unresolvedSelectors: [], builtin: true as const }
+			: resolveMcpDirectToolResolution(input.mcpDirectTools, input.cwd, input.runtimeSnapshotHost);
 	if (mcpResolution.runtimeServerNames?.length) {
 		throw new Error(formatRuntimeSnapshotMcpServersError(input.agentName, mcpResolution.runtimeServerNames));
 	}
 	if (mcpResolution.unresolvedSelectors.length > 0) {
-		throw new Error(formatUnresolvedMcpDirectToolSelectors(mcpResolution.unresolvedSelectors));
+		throw new Error(mcpResolution.builtin
+			? formatUnresolvedBuiltinMcpSelectors(input.agentName, mcpResolution.unresolvedSelectors)
+			: formatUnresolvedMcpDirectToolSelectors(mcpResolution.unresolvedSelectors));
 	}
 	const resolvedMcpSelections = mcpResolution.selections;
 	const resolvedMcpNames = new Set(resolvedMcpSelections.map((selection) => selection.name));
-	const legacyMcpNameCounts = countLegacyUnderscoreMcpToolNames(resolvedMcpSelections);
+	const legacyMcpNameCounts = mcpResolution.builtin ? new Map<string, number>() : countLegacyUnderscoreMcpToolNames(resolvedMcpSelections);
 	const effectiveMcpSelections = resolvedMcpSelections.filter(
 		(selection) =>
 			!allowedToolSet ||
@@ -369,6 +368,7 @@ export function resolvePiLaunchToolPlan(
 	const effectiveMcpTools = effectiveMcpSelections.map(
 		(selection) => selection.name,
 	);
+	const builtinMcpTools = mcpResolution.builtin ? effectiveMcpSelections : undefined;
 	const explicitToolAllowlist =
 		input.tools !== undefined ||
 		(input.mcpDirectTools?.length ?? 0) > 0 ||
@@ -404,10 +404,11 @@ export function resolvePiLaunchToolPlan(
 			: undefined;
 	if (input.fast && capabilityCeiling?.denyExtensions) throw new Error("fast mode requires a child runtime extension, but this launch denies extensions.");
 	const fastModeExtensions = resolveFastModeExtension({ fast: input.fast, model: input.model, agentName: input.agentName });
+	// Resolved per launch: an in-place package update can swap a sibling's .ts for .js.
 	const runtimeExtensions = [
-		PROMPT_RUNTIME_EXTENSION_PATH,
+		resolveRuntimeModulePath(RUNTIME_EXTENSION_DIR, "subagent-prompt-runtime"),
 		...fastModeExtensions,
-		...(fanoutAuthorized ? [FANOUT_CHILD_EXTENSION_PATH] : []),
+		...(fanoutAuthorized ? [resolveRuntimeModulePath(FANOUT_CHILD_EXTENSION_DIR, "fanout-child")] : []),
 		...(permSystemExt ? [permSystemExt] : []),
 	];
 	const disableAmbientExtensions =
@@ -498,6 +499,7 @@ export function resolvePiLaunchToolPlan(
 		resolvedMcpSelections,
 		effectiveMcpSelections,
 		effectiveMcpTools,
+		builtinMcpTools,
 		explicitToolAllowlist,
 		internalTools,
 		effectiveToolAllowlist,

@@ -448,9 +448,10 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(validateWorkflowScript(`return undefined;`), { ok: true, errors: [] });
 		assert.deepEqual(validateWorkflowScript(`return [void 0, { value: void 0 }];`), { ok: true, errors: [] });
 		assert.deepEqual(validateWorkflowScript(`return [undefined, { value: undefined }];`), { ok: true, errors: [] });
+		assert.deepEqual(validateWorkflowScript(`emit(void 0); emit([undefined, { value: undefined }]); return 1;`), { ok: true, errors: [] });
 		const result = validateWorkflowScript(`emit(void 0); emit(undefined); state.set("void", void 0); state.set("undefined", undefined); return [1, , 2];`);
 		assert.equal(result.ok, false);
-		assert.equal(result.errors.filter((error) => error.message.includes("undefined is not JSON-representable")).length, 4);
+		assert.equal(result.errors.filter((error) => error.message.includes("undefined is not JSON-representable")).length, 2);
 		assert.ok(result.errors.some((error) => error.message.includes("sparse arrays")));
 	});
 
@@ -1850,6 +1851,45 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(result.value, [{ key: "review", output: "completed", values: [null] }]);
 	});
 
+	it("normalizes undefined in emitted values the same way as returned values", async () => {
+		const script = `const value = { kept: 1, missing: undefined, list: [1, undefined] }; emit(value); emit(undefined); return value;`;
+		const result = await runWorkflowScript({
+			script,
+			timeoutMs: 2_000,
+			async launch() { throw new Error("must not launch children"); },
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+
+		assert.deepEqual(result.emits, [result.value, null]);
+		assert.deepEqual(result.value, { kept: 1, list: [1, null] });
+		await assert.rejects(
+			runWorkflowScript({
+				script: `emit({ callback: () => 1 });`,
+				timeoutMs: 2_000,
+				async launch() { throw new Error("must not launch children"); },
+				async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+			}),
+			(error: unknown) => error instanceof WorkflowScriptError && error.errorKind === "script" && error.message.includes("emit.callback must be a JSON value; received function."),
+		);
+	});
+
+	it("reports workflow script error lines relative to the script", async () => {
+		const run = (script: string) => runWorkflowScript({
+			script,
+			timeoutMs: 2_000,
+			async launch() { throw new Error("must not launch children"); },
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+		await assert.rejects(
+			run(["const first = 1;", "const second = 2;", `throw new Error("third line");`].join("\n")),
+			(error: unknown) => error instanceof WorkflowScriptError && error.errorKind === "script" && error.message.match(/workflow-script\.js:(\d+):/)?.[1] === "3",
+		);
+		await assert.rejects(
+			run(["const first = 1;", "return (;"].join("\n")),
+			(error: unknown) => error instanceof WorkflowScriptError && error.errorKind === "validation" && /SyntaxError: Unexpected token \(2:\d+\)/.test(error.message),
+		);
+	});
+
 	it("reports completed child references when return serialization fails", async () => {
 		await assert.rejects(
 			runWorkflowScript({
@@ -2772,7 +2812,6 @@ describe("scripted workflow runtime", () => {
 
 	it("rejects non-JSON-safe emitted values without persisting them", async () => {
 		const invalidScripts = [
-			`emit(undefined);`,
 			`emit(NaN);`,
 			`emit(Infinity);`,
 			`emit(new Map([["a", 1]]));`,
@@ -3372,6 +3411,14 @@ describe("scripted workflow runtime", () => {
 			await stopChild(child);
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("runs workflows when the host has frozen Promise.prototype.then in every realm", () => {
+		const preload = path.resolve("test/fixtures/frozen-promise-then-preload.cjs");
+		const fixture = path.resolve("test/fixtures/frozen-promise-then-workflow.ts");
+		const result = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", "--require", preload, fixture], { encoding: "utf-8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.deepEqual(JSON.parse(result.stdout), { ok: true, value: { output: "pong" } });
 	});
 
 	it("rejects an unavailable recovery target without falling back from a stale cwd", {

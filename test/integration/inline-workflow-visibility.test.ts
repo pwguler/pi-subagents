@@ -224,7 +224,9 @@ it("keeps coverage across a non-structural refresh when the async widget paints 
 		h.activate(); h.roster();
 		assert.match(h.asyncText(), /Workflow children shown in Fleet roster/);
 		// Elapsed seconds and tokens change the roster render key every tick without changing structure.
-		Date.now = () => realNow() + 5_000;
+		// A fixed clock keeps the prepaint and the roster paint on the same elapsed second.
+		const later = realNow() + 5_000;
+		Date.now = () => later;
 		alpha.totalTokens = { input: 30, output: 8, total: 38 };
 		const before = h.coverageCalls;
 		h.fleet.refresh();

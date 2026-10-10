@@ -10,14 +10,8 @@ export interface SubagentControlMessageDetails {
 	asyncDir?: string;
 	childIntercomTarget?: string;
 	noticeText?: string;
-}
-
-export function controlNoticeTarget(details: SubagentControlMessageDetails): string | undefined {
-	return details.childIntercomTarget;
-}
-
-export function formatSubagentControlNotice(details: SubagentControlMessageDetails, content?: string): string {
-	return details.noticeText ?? content ?? formatControlNoticeMessage(details.event, controlNoticeTarget(details));
+	/** Status-only copy of a supervisor request; the tracker sends the notice later if the request is still unanswered. */
+	noticeDeferred?: boolean;
 }
 
 function deliverControlNotice(input: {
@@ -25,7 +19,7 @@ function deliverControlNotice(input: {
 	visibleControlNotices: Set<string>;
 	details: SubagentControlMessageDetails;
 }): void {
-	const childIntercomTarget = controlNoticeTarget(input.details);
+	const childIntercomTarget = input.details.childIntercomTarget;
 	const key = controlNotificationKey(input.details.event, childIntercomTarget);
 	if (input.visibleControlNotices.has(key)) return;
 	input.visibleControlNotices.add(key);
@@ -48,6 +42,7 @@ export function handleSubagentControlNotice(input: {
 	details: SubagentControlMessageDetails;
 }): void {
 	if (!input.details?.event || input.details.event.type === "active_long_running") return;
+	if (input.details.noticeDeferred) return;
 	if (input.details.source === "foreground") {
 		// A foreground tool blocks Pi from displaying this message. The run can
 		// finish before Pi flushes it, and queued messages cannot be withdrawn.

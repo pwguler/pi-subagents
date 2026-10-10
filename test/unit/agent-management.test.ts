@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { editableAgentConfig, handleCreate, handleList, handleManagementAction, handleUpdate } from "../../src/agents/agent-management.ts";
-import { EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
+import { discoverAgents, EXTRA_AGENT_DIRS_ENV } from "../../src/agents/agents.ts";
 import { registerAgent } from "../../src/api/agents.ts";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
@@ -41,6 +41,51 @@ describe("agent management config parsing", () => {
 		clearSkillCache();
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
+
+	for (const [label, description] of [
+		["single-line", "Summarize project documentation."],
+		["multiline", "Summarize project documentation.\nKeep the summary concise."],
+		["paragraphs and indentation", "Summarize documentation.\n\n  Keep examples indented.\n保留中文说明。"],
+	]) {
+		it(`preserves ${label} descriptions when creating and rediscovering an agent`, () => {
+			const created = handleCreate(
+				{ config: { name: "doc-helper", scope: "project", description, systemPrompt: "Summarize documentation." } },
+				{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+			);
+
+			assert.equal(created.isError, false);
+			const loaded = discoverAgents(tempDir, "project").agents.find((agent) => agent.name === "doc-helper");
+			assert.ok(loaded);
+			assert.equal(loaded.description, description);
+			assert.equal(loaded.systemPrompt, "Summarize documentation.");
+			if (label === "single-line") {
+				assert.ok(fs.readFileSync(loaded.filePath, "utf-8").includes(`\ndescription: ${description}\n`));
+			}
+		});
+	}
+
+	for (const [indicator, block, description] of [
+		["|-", "  Summarize project documentation.\n  Keep the summary concise.", "Summarize project documentation.\nKeep the summary concise."],
+		[">-", "  Summarize project\n  documentation.\n\n  Keep the summary concise.", "Summarize project documentation.\nKeep the summary concise."],
+	]) {
+		it(`preserves ${indicator} descriptions when updating only the agent prompt`, () => {
+			const agentsDir = path.join(tempDir, ".pi", "agents");
+			fs.mkdirSync(agentsDir, { recursive: true });
+			fs.writeFileSync(path.join(agentsDir, "doc-helper.md"), `---\nname: doc-helper\ndescription: ${indicator}\n${block}\n---\n\nOriginal prompt.\n`);
+			assert.equal(discoverAgents(tempDir, "project").agents.find((agent) => agent.name === "doc-helper")?.description, description);
+
+			const updated = handleUpdate(
+				{ agent: "doc-helper", agentScope: "project", config: { systemPrompt: "Updated prompt." } },
+				{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+			);
+
+			assert.equal(updated.isError, false);
+			const loaded = discoverAgents(tempDir, "project").agents.find((agent) => agent.name === "doc-helper");
+			assert.ok(loaded);
+			assert.equal(loaded.systemPrompt, "Updated prompt.");
+			assert.equal(loaded.description, description);
+		});
+	}
 
 	it("surfaces JSON parse errors for create config strings", () => {
 		const result = handleCreate(
@@ -1017,6 +1062,25 @@ Advise only.
 		assert.ok(!content.includes(tempDir));
 	});
 
+	it("keeps launcher file-only: management cannot set it, conflicting runners are refused, and unrelated updates keep it", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const created = handleCreate({ config: { name: "netty", description: "Net agent", scope: "project", launcher: "net" } }, ctx);
+		assert.equal(created.isError, true);
+		assert.match(readText(created), /config\.launcher is not supported/);
+		assert.equal(fs.existsSync(path.join(tempDir, ".pi", "agents", "netty.md")), false);
+
+		const agentPath = path.join(tempDir, ".pi", "agents", "sandboxed.md");
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(agentPath, "---\nname: sandboxed\ndescription: Sandboxed agent\nlauncher: net\n---\nOriginal prompt.\n");
+		const external = handleUpdate({ agent: "sandboxed", config: { runner: { type: "external-cli", command: "node" } } }, ctx);
+		assert.equal(external.isError, true);
+		assert.match(readText(external), /cannot be combined with this agent's 'launcher'/);
+
+		const updated = handleUpdate({ agent: "sandboxed", config: { description: "Updated agent" } }, ctx);
+		assert.equal(updated.isError, false);
+		assert.match(fs.readFileSync(agentPath, "utf-8"), /^launcher: net$/m);
+	});
+
 	it("fails when extension frontmatter cannot be reread", () => {
 		const filePath = path.join(tempDir, ".pi", "agents", "removed.md");
 		assert.throws(
@@ -1179,7 +1243,7 @@ Drive the failing test first.
 	});
 
 	for (const action of ["model", "thinking"]) {
-		it(`awaits an offline registry refresh before opening the ${action} picker`, async () => {
+		it(`awaits an offline registry refresh before opening the ${action} picker over RPC`, async () => {
 			const agentPath = path.join(tempDir, ".pi", "agents", "refresh-worker.md");
 			fs.mkdirSync(path.dirname(agentPath), { recursive: true });
 			fs.writeFileSync(agentPath, "---\nname: refresh-worker\ndescription: Refresh test\nmodel: custom/fresh\n---\nPrompt.\n");
@@ -1187,7 +1251,7 @@ Drive the failing test first.
 			let choices: string[] = [];
 			const warnings: string[] = [];
 			await openSubagentsAdmin({ sendMessage: () => assert.fail("cancel must not save") } as never, {
-				cwd: tempDir, hasUI: true,
+				cwd: tempDir, hasUI: true, mode: "rpc",
 				modelRegistry: {
 					refresh: async (options: { allowNetwork: boolean; signal: AbortSignal }) => {
 						assert.equal(options.allowNetwork, false);
@@ -1201,6 +1265,8 @@ Drive the failing test first.
 						: [],
 				},
 				ui: {
+					// RPC mode defines ui.custom as a no-op that resolves undefined.
+					custom: async () => undefined,
 					select: async (_title: string, items: string[]) => { choices = items; return undefined; },
 					notify: (message: string) => warnings.push(message),
 				},

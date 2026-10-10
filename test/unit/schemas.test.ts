@@ -24,22 +24,8 @@ interface SubagentParamsSchema {
 			minimum?: number;
 			description?: string;
 		};
-		workflow?: {
-			type?: string;
-			minLength?: number;
-			description?: string;
-		};
+		workflow?: JsonSchemaNode;
 		args?: JsonSchemaNode;
-		workflowScript?: {
-			type?: string;
-			minLength?: number;
-			description?: string;
-		};
-		workflowScriptPath?: {
-			type?: string;
-			minLength?: number;
-			description?: string;
-		};
 		globalConcurrencyLimit?: {
 			type?: string;
 			minimum?: number;
@@ -167,12 +153,18 @@ function getPropertySchema(schema: JsonSchemaNode | undefined, path: string[]): 
 }
 
 let schemas: Record<string, JsonSchemaNode> = {};
+// Full flat property schemas: RPC validation and model `options` validation both use these definitions.
 let SubagentParams: SubagentParamsSchema | undefined;
+// What the model-facing tool sends to the provider: execution fields plus one opaque options object.
+let ProviderParams: JsonSchemaNode | undefined;
+let createProviderSchema: ((disabled?: unknown) => JsonSchemaNode) | undefined;
 let SubagentWaitParams: JsonSchemaNode | undefined;
 let schemasAvailable = true;
 try {
 	schemas = await import("../../src/extension/schemas.ts") as Record<string, JsonSchemaNode>;
-	SubagentParams = schemas.SubagentParams as SubagentParamsSchema;
+	SubagentParams = schemas.SubagentFlatParams as SubagentParamsSchema;
+	ProviderParams = schemas.SubagentParams;
+	createProviderSchema = schemas.createSubagentParamsSchema as unknown as typeof createProviderSchema;
 	SubagentWaitParams = schemas.SubagentWaitParams as JsonSchemaNode;
 } catch (error) {
 	if (missingPackageName(error) !== "typebox") throw error;
@@ -196,10 +188,6 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(validator.Check({ ...base, outputSchema: { type: "object" } }), true);
 		assert.equal(validator.Check({ ...base, outputSchema: false }), true);
 		assert.equal(validator.Check({ ...base, outputSchema: null }), false);
-		assert.equal(validator.Check({ task: "work", chain: [{ agent: "worker", outputSchema: false }] }), true);
-		const collectSchema = schemas.DynamicCollectSchema;
-		assert.ok(collectSchema);
-		assert.equal(CompileSchema!(collectSchema).Check({ as: "all", outputSchema: false }), false);
 	});
 
 	it("includes context field and default precedence for fresh/fork execution mode", () => {
@@ -218,29 +206,19 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(description, /else fresh/);
 	});
 
-	it("exposes named resources plus raw inline and file workflow script modes", () => {
+	it("exposes one workflow field for the reply block, script paths, and named resources", () => {
 		const workflow = SubagentParams?.properties?.workflow;
-		assert.equal(workflow?.type, "string");
-		assert.equal(workflow?.minLength, 1);
-		assert.match(String(workflow?.description ?? ""), /extension-owned workflow resource/i);
+		assert.equal(hasAnyOfType(workflow, "boolean"), true);
+		assert.equal(anyOfBranches(workflow).find((branch) => branch.type === "string")?.minLength, 1);
+		assert.match(String(workflow?.description ?? ""), /true: run the one ```js workflow block written in this same reply/);
+		assert.match(String(workflow?.description ?? ""), /String with '\/': script file read from request cwd/);
+		assert.match(String(workflow?.description ?? ""), /Other string: named workflow resource/);
+		assert.match(String(workflow?.description ?? ""), /no runs.host/);
 		const args = SubagentParams?.properties?.args;
 		assert.equal(args?.type, "object");
 		assert.equal(args?.maxProperties, 16);
-		assert.match(String(args?.description ?? ""), /bounded plain-JSON/i);
-		assert.match(String(args?.description ?? ""), /inline.*file-backed.*deeply frozen.*persisted.*secrets/i);
-		const workflowScript = SubagentParams?.properties?.workflowScript;
-		assert.equal(workflowScript?.type, "string");
-		assert.equal(workflowScript?.minLength, 1);
-		assert.match(String(workflowScript?.description ?? ""), /Inline JavaScript statement body/);
-		assert.match(String(workflowScript?.description ?? ""), /top-level await/);
-		assert.match(String(workflowScript?.description ?? ""), /no runs.host/);
-		assert.match(String(workflowScript?.description ?? ""), /guide workflows/);
-		const workflowScriptPath = SubagentParams?.properties?.workflowScriptPath;
-		assert.equal(workflowScriptPath?.type, "string");
-		assert.equal(workflowScriptPath?.minLength, 1);
-		assert.match(String(workflowScriptPath?.description ?? ""), /mutually exclusive with workflowScript/i);
-		assert.match(String(workflowScriptPath?.description ?? ""), /request cwd/i);
-		assert.match(String(workflowScriptPath?.description ?? ""), /host reads.*before sandbox/i);
+		assert.match(String(args?.description ?? ""), /plain-JSON args for workflow; 16 fields\/object, 64 items\/array, depth 8, 16 KiB total;/i);
+		assert.match(String(args?.description ?? ""), /raw-script.*deeply frozen.*persisted.*secrets/i);
 		for (const name of ["globalConcurrencyLimit", "maxSubagentSpawnsPerRun"] as const) {
 			const capacity = SubagentParams?.properties?.[name];
 			assert.equal(capacity?.type, "integer");
@@ -284,7 +262,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 	});
 
 	it("omits removed legacy and workflow-child-only fields", () => {
-		for (const name of ["tasks", "chain", "concurrency", "chainDir", "step", "schedule", "scheduleName", "resume"]) {
+		for (const name of ["tasks", "chain", "concurrency", "chainDir", "step", "schedule", "scheduleName", "resume", "workflowScript", "workflowScriptPath"]) {
 			assert.equal((SubagentParams?.properties as Record<string, unknown> | undefined)?.[name], undefined, `${name} should not be public`);
 		}
 	});
@@ -297,8 +275,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(actionSchema.enum, undefined);
 		const description = String(actionSchema.description ?? "");
 		assert.match(description, /Management\/control only; omit for execution/);
-		assert.match(description, /validate accepts either script input/);
-		assert.match(description, /guide topic tool-reference/);
+		assert.match(description, /validate accepts workflow: true or a script path/);
+		assert.match(description, /\{action:"guide",options:\{topic:"tool-reference"\}\}/);
 		assert.doesNotMatch(description, /orchestration\./);
 	});
 
@@ -417,20 +395,12 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		const all = properties?.all;
 		const stopOnAttention = properties?.stopOnAttention;
 		const timeoutMs = properties?.timeoutMs;
-		assert.ok(id, "id schema should exist");
-		assert.match(String(id.description ?? ""), /ordinary async subagent runs already notify this session natively/i);
-		assert.match(String(id.description ?? ""), /same-turn blocking results are truly needed/);
-		assert.ok(nonBlocking, "nonBlocking schema should exist");
-		assert.match(String(nonBlocking.description ?? ""), /provider, detached, or other background work without a native completion notification/i);
-		assert.match(String(nonBlocking.description ?? ""), /do not need a subscription/);
-		assert.ok(all, "all schema should exist");
-		assert.match(String(all.description ?? ""), /same-turn result.*truly needed/);
-		assert.doesNotMatch(String(all.description ?? ""), /spawn a replacement/);
-		assert.ok(stopOnAttention, "stopOnAttention schema should exist");
-		assert.equal(stopOnAttention.type, "boolean");
-		assert.match(String(stopOnAttention.description ?? ""), /idle or long-thinking attention/);
-		assert.match(String(timeoutMs?.description ?? ""), /waitTool\.defaultTimeoutMs/);
-		assert.match(String(timeoutMs?.description ?? ""), /non-error active-work result/);
+		assert.equal(id?.type, "string");
+		assert.equal(nonBlocking?.type, "boolean");
+		assert.equal(all?.type, "boolean");
+		assert.equal(stopOnAttention?.type, "boolean");
+		assert.equal(timeoutMs?.type, "integer");
+		assert.equal(timeoutMs?.minimum, 1);
 	});
 
 	it("does not emit description-only schema nodes", () => {
@@ -489,22 +459,24 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.deepEqual(missingItemsPaths, []);
 	});
 
-	it("keeps only top-level parameter descriptions to keep the provider payload compact", () => {
-		assert.ok(SubagentParams, "SubagentParams schema should exist");
-		const schema = SubagentParams as unknown as JsonSchemaNode;
+	it("keeps only top-level parameter descriptions to keep the provider payload compact", async () => {
+		assert.ok(ProviderParams, "SubagentParams schema should exist");
+		const schema = ProviderParams;
 		const serialized = JSON.stringify(schema);
-		assert.ok(serialized.length <= 13_000, `expected concise schema at or under 13k chars, got ${serialized.length}`);
+		assert.ok(serialized.length <= 2_100, `expected concise schema at or under 2,100 chars, got ${serialized.length}`);
 		assert.equal(serialized.includes('"$ref"'), false);
 		assert.equal(serialized.includes('"$defs"'), false);
-		assert.equal(serialized.split("Evidence policy;").length - 1, 1);
-		assert.match(String((schema.properties as Record<string, JsonSchemaNode> | undefined)?.agent?.description ?? ""), /management target/);
-		const acceptanceDescription = String((schema.properties as Record<string, JsonSchemaNode> | undefined)?.acceptance?.description ?? "");
-		assert.match(acceptanceDescription, /Evidence policy/);
-		assert.match(acceptanceDescription, /guide tool-reference.*levels, evidence and review.required/);
-		const missionDescription = String((schema.properties as Record<string, JsonSchemaNode> | undefined)?.mission?.description ?? "");
-		assert.match(missionDescription, /exactly one non-empty title or summary/);
-		assert.match(missionDescription, /goal only true/);
-		assert.match(missionDescription, /requires budget\.tokens/);
+		const properties = schema.properties as Record<string, JsonSchemaNode>;
+		assert.deepEqual(Object.keys(properties), ["agent", "task", "workflow", "args", "async", "model", "cwd", "worktree", "output", "action", "id", "message", "options"]);
+		assert.match(String(properties.agent?.description ?? ""), /management target/);
+		assert.equal(properties.options?.type, "object");
+		assert.equal(properties.options?.additionalProperties, true);
+		assert.equal(properties.options?.properties, undefined);
+		assert.match(String(properties.options?.description ?? ""), /acceptance, timeoutMs.*guide tool-reference\/parameter-reference/);
+		const { resolveDisabledFeatureSurface } = await import("../../src/shared/disabled-features.ts");
+		const structured = createProviderSchema!(resolveDisabledFeatureSurface({ disabledFeatures: ["workflow-scripts"] }));
+		assert.ok(JSON.stringify(structured).length <= 2_400, `expected structured schema at or under 2,400 chars, got ${JSON.stringify(structured).length}`);
+		assert.deepEqual(Object.keys(structured.properties as JsonSchemaNode), ["agent", "task", "tasks", "chain", "async", "model", "cwd", "worktree", "output", "action", "id", "message", "options"]);
 
 		const nestedDescriptionPaths: string[] = [];
 		const stack: Array<{ path: string; value: unknown }> = [{ path: "SubagentParams", value: schema }];
@@ -525,8 +497,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 	});
 
 	it("preserves TypeBox metadata while pruning provider-visible descriptions", () => {
-		assert.ok(SubagentParams, "SubagentParams schema should exist");
-		const schema = SubagentParams as unknown as JsonSchemaNode;
+		assert.ok(ProviderParams, "SubagentParams schema should exist");
+		const schema = ProviderParams;
 		const rootKind = Object.getOwnPropertyDescriptor(schema, "~kind");
 		assert.equal(rootKind?.value, "Object");
 		assert.equal(rootKind?.enumerable, false);
@@ -539,7 +511,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 
 	it("does not emit provider-rejected schema shapes", () => {
 		const rejectedPaths: string[] = [];
-		const rejectedKeywords = ["allOf", "const", "if", "then", "not"];
+		// Strict tool-schema validators reject `deprecated` with HTTP 400 (#2713).
+		const rejectedKeywords = ["allOf", "const", "if", "then", "not", "deprecated"];
 
 		for (const [name, schema] of Object.entries(schemas)) {
 			const stack: Array<{ path: string; value: unknown }> = [{ path: name, value: schema }];
@@ -557,6 +530,11 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 				}
 				if (Object.hasOwn(node, "anyOf") && Object.hasOwn(node, "type")) {
 					rejectedPaths.push(`${current.path}.type+anyOf`);
+				}
+				// llama.cpp grammar conversion rejects patterns not anchored with both ^ and $.
+				// oxlint-disable-next-line anti-slop/no-runtime-typeof -- Inspecting JSON Schema pattern representation is the portability contract under test.
+				if (typeof node.pattern === "string" && !(node.pattern.startsWith("^") && node.pattern.endsWith("$"))) {
+					rejectedPaths.push(`${current.path}.pattern`);
 				}
 				for (const keyword of rejectedKeywords) {
 					if (Object.hasOwn(node, keyword)) rejectedPaths.push(`${current.path}.${keyword}`);
@@ -606,9 +584,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.deepEqual(acceptanceLevelBranch?.enum, ["auto", "attested", "checked"], "verified requires object form with runtime commands");
 		const reviewedRecoveryBranch = acceptanceStringBranches.find((branch) => Array.isArray(branch.enum) && branch.enum.includes("reviewed"));
 		assert.deepEqual(reviewedRecoveryBranch?.enum, ["reviewed"]);
-		assert.equal(reviewedRecoveryBranch?.deprecated, true);
 		const acceptanceObjectStringBranch = acceptanceStringBranches.find((branch) => branch.enum === undefined);
-		assert.equal(acceptanceObjectStringBranch?.pattern, "^\\s*\\{", "acceptance should tolerate only object-shaped JSON strings");
+		assert.equal(acceptanceObjectStringBranch?.pattern, "^\\s*\\{[\\s\\S]*$", "acceptance should tolerate only object-shaped JSON strings");
 		assert.match(String(acceptanceSchema.description ?? ""), /omit for read-only\/review/i);
 		assert.match(String(acceptanceSchema.description ?? ""), /prefer object/i);
 		assert.match(String(acceptanceSchema.description ?? ""), /false disables; true invalid/i);
@@ -639,11 +616,11 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		}
 		const validValues = [
 			{ skill: "review" },
-			{ workflowScript: "return await runs.run(\"one\", {agent: \"reviewer\", task: \"check\"})" },
-			{ workflowScriptPath: "workflows/review.js" },
+			{ workflow: true },
+			{ workflow: "workflows/review.js" },
 			{ skill: false },
 			{ action: "get", agent: "worker" },
-			{ workflowScript: "return runs.run('main', { agent: 'worker', task: 'Fix', acceptance: false })", timeoutMs: 1000 },
+			{ workflow: true, timeoutMs: 1000 },
 			{ action: "steer", id: "run-1", message: "focus on tests" },
 			{ action: "steer", id: "run-1", index: 0, message: "focus on tests" },
 			{ action: "not-a-real-action" },
@@ -652,6 +629,8 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ agent: "worker", task: "Fix", acceptance: JSON.stringify({ level: "checked", evidence: ["commands-run"] }) },
 		];
 		const invalidValues = [
+			{ workflow: "" },
+			{ workflow: 123 },
 			{ skill: 123 },
 			{ skill: [123] },
 			{ output: 123 },

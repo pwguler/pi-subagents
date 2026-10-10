@@ -4,10 +4,12 @@ import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
-import type { SubagentState } from "../../src/shared/types.ts";
-import { releaseActiveRunIndex, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import type { AsyncStatus, SubagentState } from "../../src/shared/types.ts";
+import { readActiveRunIndex, releaseActiveRunIndex, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
+import { readRecentTerminalRunIndex, readTerminalRunToolCallIndex, updateTerminalRunIndex, TERMINAL_RUN_INDEX_DIR } from "../../src/runs/background/terminal-run-index.ts";
+import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { removeForegroundControlIfIdle } from "../../src/runs/foreground/subagent-executor.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
@@ -230,6 +232,124 @@ describe("subagent run id resolver", () => {
 			assert.equal(done?.id, "workflow-done");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves retained terminal aliases without scanning unrelated runs or mixing session indexes", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-terminal-alias-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const toolCallId = `call_${"界".repeat(100)}`;
+		for (const [runId, sessionId, endedAt, alias] of [
+			["retained", "@tool-calls", 1, toolCallId],
+			["unrelated", "tool-calls", 2, undefined],
+		] as const) {
+			const dir = path.join(root, runId);
+			const status: AsyncStatus = { runId, sessionId, state: "complete", mode: "single", startedAt: 1, endedAt, ...(alias ? { toolCallId: alias } : {}) };
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status));
+			updateTerminalRunIndex(dir, status);
+		}
+		assert.deepEqual(readRecentTerminalRunIndex(root), ["unrelated", "retained"]);
+		assert.deepEqual(readRecentTerminalRunIndex(root, { limit: 1 }), ["unrelated"]);
+		assert.deepEqual(readRecentTerminalRunIndex(root, { sessionId: "@tool-calls" }), ["retained"]);
+		const readdir = fsDefault.readdirSync;
+		t.mock.method(fsDefault, "readdirSync", (dir, ...args) => {
+			assert.notEqual(String(dir), root, "alias lookup must not scan run directories");
+			assert.notEqual(String(dir), path.join(root, TERMINAL_RUN_INDEX_DIR), "alias lookup must not scan sessions");
+			assert.notEqual(String(dir), path.join(root, "unrelated"));
+			return Reflect.apply(readdir, fsDefault, [dir, ...args]);
+		});
+		syncBuiltinESMExports();
+		try {
+			assert.equal(resolveSubagentRunId(toolCallId, { asyncDirRoot: root, resultsDir: path.join(root, "results") })?.id, "retained");
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		}
+	});
+
+	it("reports an alias shared by a live run and a delivered run as ambiguous", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-terminal-alias-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const toolCallId = "rpc-spawn-original-request";
+		const retainedDir = path.join(root, "retained-run");
+		const retained: AsyncStatus = { runId: "retained-run", sessionId: "s", state: "complete", mode: "single", startedAt: 1, endedAt: 2, toolCallId };
+		fs.mkdirSync(retainedDir, { recursive: true });
+		fs.writeFileSync(path.join(retainedDir, "status.json"), JSON.stringify(retained));
+		updateTerminalRunIndex(retainedDir, retained);
+		const liveDir = path.join(root, "live-run");
+		fs.mkdirSync(liveDir, { recursive: true });
+		const state = { asyncJobs: new Map([["live-run", { asyncId: "live-run", asyncDir: liveDir, toolCallId }]]), foregroundControls: new Map() } as unknown as SubagentState;
+		const deps = { asyncDirRoot: root, resultsDir: path.join(root, "results") };
+		assert.throws(() => resolveSubagentRunId(toolCallId, { ...deps, state }), /ambiguous across async runs/);
+		assert.equal(resolveSubagentRunId(toolCallId, deps)?.id, "retained-run", "without a live run the delivered run's alias is unique");
+	});
+
+	it("cleans stale and mismatched terminal alias pointers without resolving them", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-terminal-alias-stale-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const toolCallId = "call-retained";
+		for (const mismatch of ["missing", "runId", "sessionId", "toolCallId", "state", "malformed", "unsafe"] as const) {
+			const dir = path.join(root, mismatch);
+			const status: AsyncStatus = { runId: mismatch, sessionId: "owner", toolCallId, mode: "single", state: "complete", startedAt: 1 };
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status));
+			updateTerminalRunIndex(dir, status);
+			const marker = path.join(root, TERMINAL_RUN_INDEX_DIR, "@tool-calls", encodeIndexSegment(toolCallId), `${mismatch}.json`);
+			if (mismatch === "missing") fs.unlinkSync(path.join(dir, "status.json"));
+			else if (mismatch === "malformed") fs.writeFileSync(marker, "{");
+			else if (mismatch === "unsafe") fs.writeFileSync(marker, JSON.stringify({ version: 1, runId: "../outside", sessionId: "owner", endedAt: 1 }));
+			else fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ ...status, [mismatch]: mismatch === "state" ? "running" : "different" }));
+			assert.deepEqual(readTerminalRunToolCallIndex(root, toolCallId), []);
+			assert.equal(fs.existsSync(marker), false, `${mismatch} pointer was removed`);
+		}
+		assert.equal(resolveSubagentRunId(toolCallId, { asyncDirRoot: root, resultsDir: path.join(root, "results") }), undefined);
+	});
+
+	it("reports optional terminal alias write failures without blocking active marker release", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-terminal-alias-write-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const dir = path.join(root, "retained");
+		const status: AsyncStatus = { runId: "retained", sessionId: "owner", toolCallId: "call-retained", mode: "single", state: "complete", startedAt: 1 };
+		fs.mkdirSync(dir, { recursive: true });
+		updateActiveRunIndex(dir, "running", status.toolCallId);
+		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status));
+		fs.mkdirSync(path.join(root, TERMINAL_RUN_INDEX_DIR));
+		// A file at the alias namespace blocks only the optional alias publication.
+		fs.writeFileSync(path.join(root, TERMINAL_RUN_INDEX_DIR, "@tool-calls"), "blocked");
+		const errors: unknown[][] = [];
+		t.mock.method(console, "error", (...args) => { errors.push(args); });
+		updateActiveRunIndex(dir, "complete", status.toolCallId, { terminalIndexBeforeRelease: true, retryCapacityErrors: true });
+		assert.deepEqual(readActiveRunIndex(root), []);
+		assert.deepEqual(readRecentTerminalRunIndex(root), ["retained"]);
+		assert.equal(errors.length, 1);
+		assert.match(String(errors[0]?.[0]), /terminal-run tool-call index/);
+		assert.ok(errors[0]?.[1] instanceof Error);
+	});
+
+	it("preserves terminal alias read errors instead of treating them as missing evidence", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-terminal-alias-error-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const dir = path.join(root, "retained");
+		const toolCallId = "call-retained";
+		const status: AsyncStatus = { runId: "retained", sessionId: "owner", toolCallId, mode: "single", state: "complete", startedAt: 1 };
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status));
+		updateTerminalRunIndex(dir, status);
+		const marker = path.join(root, TERMINAL_RUN_INDEX_DIR, "@tool-calls", toolCallId, "retained.json");
+		const readFile = fsDefault.readFileSync;
+		const failure = Object.assign(new Error("terminal alias permission denied"), { code: "EACCES" });
+		t.mock.method(fsDefault, "readFileSync", (file, ...args) => {
+			if (String(file) === marker) throw failure;
+			return Reflect.apply(readFile, fsDefault, [file, ...args]);
+		});
+		syncBuiltinESMExports();
+		try {
+			assert.throws(() => resolveSubagentRunId(toolCallId, { asyncDirRoot: root, resultsDir: path.join(root, "results") }), (error) => error === failure);
+			assert.equal(fs.existsSync(marker), true);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
 		}
 	});
 

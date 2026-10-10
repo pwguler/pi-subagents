@@ -1,10 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
-import { captureWatchdogDiffBaseline, type WatchdogDiffBaseline } from "./diff-tool.ts";
+import { startWatchdogDiffBaselineCapture, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { formatWatchdogRecommendation, recommendWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
-import { renderWatchdogWarning } from "./render.ts";
 import { createMainWatchdogReview } from "./review.ts";
 import { MainWatchdogRuntime, type WatchdogReviewFunction } from "./runtime.ts";
 import { getWatchdogUserSettingsPath, writeUserWatchdogEnabled, writeWatchdogModelSettings } from "./settings.ts";
@@ -12,7 +10,6 @@ import {
 	SUBAGENT_WATCHDOG_WARNING_TYPE,
 	type WatchdogRuntimeStatus,
 	type WatchdogWarning,
-	type WatchdogWarningDetails,
 } from "./types.ts";
 import { createWatchdogWarningMessage } from "./warning-format.ts";
 
@@ -149,7 +146,7 @@ export function buildWatchdogStatus(snapshot: ReturnType<MainWatchdogRuntime["ge
 		"- /subagents-watchdog model <provider/model[:thinking]>",
 		"- /subagents-watchdog model inherit",
 		"- /subagents-watchdog session model recommended",
-		"Agent action: subagent({ action: \"watchdog.configure\", model: \"recommended\", scope: \"session\" })",
+		"Agent action: subagent({ action: \"watchdog.configure\", model: \"recommended\", options: { scope: \"session\" } })",
 	);
 	return lines.join("\n");
 }
@@ -372,7 +369,7 @@ async function handleWatchdogCommand(
 
 export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatchdogOptions = {}): MainWatchdogRuntime {
 	let currentContext: ExtensionContext | undefined;
-	let diffBaseline: WatchdogDiffBaseline | undefined;
+	let diffBaseline: Promise<WatchdogDiffBaseline | undefined> | undefined;
 	const rememberContext = (ctx: ExtensionContext) => {
 		currentContext = ctx;
 	};
@@ -385,23 +382,6 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		displayClarification: (content) => pi.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
 	});
 
-	pi.registerMessageRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (message, renderOptions, theme) => {
-		const details = message.details as WatchdogWarningDetails | undefined;
-		if (!details?.summary || !details.evidence || !details.recommendedAction) {
-			const content = typeof message.content === "string"
-				? message.content
-				: message.content.filter((entry) => entry.type === "text").map((entry) => entry.text).join("\n");
-			return new Text(content, 0, 0);
-		}
-		return renderWatchdogWarning(details, renderOptions, theme);
-	});
-	pi.registerEntryRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (entry, renderOptions, theme) => {
-		const details = entry.data as WatchdogWarningDetails | undefined;
-		return details?.summary && details.evidence && details.recommendedAction
-			? renderWatchdogWarning(details, renderOptions, theme)
-			: undefined;
-	});
-
 	pi.registerCommand("subagents-watchdog", {
 		description: "Show or toggle the default-off subagent watchdog",
 		handler: (args, ctx) => {
@@ -412,7 +392,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 
 	pi.on("session_start", (_event, ctx) => {
 		rememberContext(ctx);
-		diffBaseline = captureWatchdogDiffBaseline(ctx.cwd);
+		diffBaseline = startWatchdogDiffBaselineCapture(ctx.cwd);
 		runtime.bindSession(ctx);
 	});
 	pi.on("before_agent_start", (event, ctx) => {
@@ -423,7 +403,7 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		rememberContext(ctx);
 		runtime.handleTurnEnd(event, ctx);
 	});
-	pi.on("input", (event) => { if (event.source !== "extension") runtime.handleUserInput(); });
+	pi.on("input", (event) => runtime.handleUserInput(event));
 	pi.on("model_select", () => runtime.handleModelChange());
 	pi.on("tool_result", (_event, ctx) => {
 		rememberContext(ctx);
